@@ -17,7 +17,7 @@ const UA =
 
 // ---- НАСТРОЙКИ ----
 const RUN_TIMEOUT_MS = 140_000;        // бюджет на 1 run (partial если не успели)
-const INFLIGHT_STALE_MS = 3 * 60_000; // inflight > 3 мин => считаем зависшим
+const INFLIGHT_STALE_MS = 3 * 70_000; // inflight > 3 мин => считаем зависшим
 
 // скорость (достаточно быстро и обычно стабильно)
 const WORKER_BATCH = 6;
