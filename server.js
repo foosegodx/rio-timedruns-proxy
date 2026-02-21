@@ -7,8 +7,8 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "1mb" }));
 
-// ✅ bump версии кэша (чтобы warband пересчитался сразу)
-const CACHE_VER = "v8";
+// ✅ bump версии кэша (чтобы warband пересчитался)
+const CACHE_VER = "v9";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -32,7 +32,7 @@ const PARTIAL_RETRY_DELAY_MS = 30_000;
 const partialAttempts = new Map(); // runUrl -> attempts
 
 // warband попытка (чтобы не зависать)
-const WAR_BAND_TIMEOUT_MS = 15_000;
+const WAR_BAND_TIMEOUT_MS = 30_000;
 
 const runKey = (u) => `run:${CACHE_VER}:${u}`;
 const ttKey = (regionHint, realm, name) =>
@@ -173,10 +173,10 @@ async function getContext() {
     const browser = await browserPromise;
     const context = await browser.newContext({ userAgent: UA });
 
-    // режем лишние ресурсы
+    // ✅ режем лишние ресурсы, но оставляем stylesheet (иногда влияет на появление табов)
     await context.route("**/*", (route) => {
       const rt = route.request().resourceType();
-      if (!["document", "script", "xhr", "fetch"].includes(rt)) return route.abort();
+      if (!["document", "script", "xhr", "fetch", "stylesheet"].includes(rt)) return route.abort();
       return route.continue();
     });
 
@@ -332,19 +332,7 @@ function parseDiscordFromText(text) {
 
 // ----- WAR BAND helpers -----
 
-async function detectHasWarband(page) {
-  // максимально надёжно: смотрим реальные элементы интерфейса
-  return await page
-    .evaluate(() => {
-      const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
-      const els = Array.from(document.querySelectorAll("a,button,[role='tab']"));
-      return els.some((el) => norm(el.textContent).includes("warband"));
-    })
-    .catch(() => false);
-}
-
 async function findWarbandUrlFromPage(page) {
-  // 1) href в DOM
   const href = await page
     .evaluate(() => {
       const abs = (raw) => {
@@ -378,7 +366,6 @@ async function findWarbandUrlFromPage(page) {
 
   if (href) return href;
 
-  // 2) иногда ссылка прячется в __NEXT_DATA__ / script json
   const fromScripts = await page
     .evaluate(() => {
       const abs = (raw) => {
@@ -439,6 +426,18 @@ async function findWarbandUrlFromPage(page) {
   return fromScripts || null;
 }
 
+async function waitForWarbandTab(page, timeoutMs = 12000) {
+  const loc = page
+    .locator('a:has-text("Warband"), button:has-text("Warband"), [role="tab"]:has-text("Warband")')
+    .first();
+  try {
+    await loc.waitFor({ state: "attached", timeout: timeoutMs });
+    return loc;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchWarbandUrl(context, region, realm, name) {
   const ck = wbKey(region, realm, name);
   const cached = getC(ck);
@@ -455,8 +454,9 @@ async function fetchWarbandUrl(context, region, realm, name) {
   try {
     await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
 
-    const hasWar = await detectHasWarband(page);
-    if (!hasWar) {
+    // ✅ Ждём вкладку Warband (она часто появляется с задержкой)
+    const tab = await waitForWarbandTab(page, 12000);
+    if (!tab) {
       setC(ck, null);
       return null;
     }
@@ -468,12 +468,9 @@ async function fetchWarbandUrl(context, region, realm, name) {
       return url;
     }
 
-    // 2) клик по Warband и повтор
-    await page
-      .locator('a:has-text("Warband"), button:has-text("Warband"), [role="tab"]:has-text("Warband")')
-      .first()
-      .click({ timeout: 6000 })
-      .catch(() => {});
+    // 2) кликаем Warband и пробуем снова
+    await tab.click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(800);
 
     url = await findWarbandUrlFromPage(page);
     if (url) {
@@ -481,7 +478,7 @@ async function fetchWarbandUrl(context, region, realm, name) {
       return url;
     }
 
-    // 3) если warband есть, но URL не выдаётся (SPA) — отдаём fallback (чтобы G не была пустой)
+    // 3) Warband есть, но URL нигде не светится (SPA вкладка) — отдаём fallback
     const fallback = profileUrl + "?tab=warband";
     setC(ck, fallback);
     return fallback;
