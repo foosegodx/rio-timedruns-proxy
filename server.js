@@ -18,10 +18,10 @@ const UA =
 // ---- НАСТРОЙКИ СТАБИЛЬНОСТИ ----
 const RUN_TIMEOUT_MS = 70_000;        // бюджет на 1 run (внутри вернём partial, если не успели)
 const INFLIGHT_STALE_MS = 3 * 60_000; // если "в работе" > 3 мин — считаем зависшим
-const WORKER_BATCH = 4;               // сколько run-ов брать за раз из очереди
+const WORKER_BATCH = 6;               // сколько run-ов брать за раз из очереди
 
 // ✅ ВАЖНО: ставим 1 для стабильности. Потом можно попробовать 2.
-const WORKER_PARALLEL = 1;
+const WORKER_PARALLEL = 2;
 
 // в lowestFromRun сейчас последовательный обход участников, PER_RUN_PARALLEL не используется,
 // но оставим на будущее
