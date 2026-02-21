@@ -5,6 +5,9 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ✅ нужно для POST JSON
+app.use(express.json({ limit: "1mb" }));
+
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
 const regions = ["eu", "us", "kr", "tw", "cn"];
@@ -59,7 +62,6 @@ function normalizeRegion(regionRaw) {
 // base64 websafe (Apps Script) -> utf8
 function decodeBase64WebSafeToUtf8(enc) {
   const s = String(enc || "");
-  // Node умеет base64url в новых версиях, но делаем максимально совместимо:
   let b64 = s.replace(/-/g, "+").replace(/_/g, "/");
   while (b64.length % 4) b64 += "=";
   return Buffer.from(b64, "base64").toString("utf8");
@@ -124,7 +126,7 @@ async function getContext() {
     const browser = await browserPromise;
     const context = await browser.newContext({ userAgent: UA });
 
-    // максимально режем ресурсы (CSS тоже можно резать — нам важен текст)
+    // режем лишнее
     await context.route("**/*", (route) => {
       const rt = route.request().resourceType();
       if (!["document", "script", "xhr", "fetch"].includes(rt)) return route.abort();
@@ -182,7 +184,6 @@ async function fetchRunRoster(runUrl) {
         (c.realm && (c.realm.slug || c.realm.name)) ||
         null;
 
-      // ВАЖНО: если run-details отдаёт region — используем, чтобы НЕ перебирать 5 регионов
       const regionRaw = c.region || c.regionSlug || c.region_name || null;
 
       const realm = normalizeRealm(realmRaw);
@@ -198,11 +199,10 @@ async function fetchRunRoster(runUrl) {
 }
 
 function charKey(c) {
-  // region может быть пустым — тогда ключ без региона
   return `${(c.region || "").toLowerCase()}:${c.realm.toLowerCase()}:${c.name.toLowerCase()}`;
 }
 
-// --- Получение timed5 по персонажу (с минимальным числом попыток) ---
+// --- Получение timed5 по персонажу ---
 async function fetchTimed5(context, realm, name, regionHint) {
   const ck = `t5:${(regionHint || "").toLowerCase()}:${realm}:${name}`.toLowerCase();
   const cached = getC(ck);
@@ -224,7 +224,6 @@ async function fetchTimed5(context, realm, name, regionHint) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 12000 });
 
-      // Пытаемся вытащить точечный текст (быстрее, чем body.innerText)
       let txt = null;
       try {
         const loc = page.locator("text=/5\\+\\s+Keystone\\s+Timed\\s+Runs/i").first();
@@ -234,7 +233,6 @@ async function fetchTimed5(context, realm, name, regionHint) {
 
       let v = txt ? parseTimed5(txt) : null;
 
-      // fallback: если структура изменилась — читаем весь текст
       if (v === null) {
         const bodyText = await page.evaluate(() => document.body?.innerText || "");
         v = parseTimed5(bodyText);
@@ -245,19 +243,17 @@ async function fetchTimed5(context, realm, name, regionHint) {
         return v;
       }
     } catch {
-      // ignore and try next region
+      // ignore
     } finally {
       await page.close();
     }
-
-    // если регион был подсказан (regionHint) и не сработал — тогда имеет смысл пробовать остальные
   }
 
   setC(ck, null);
   return null;
 }
 
-// --- Вычисление lowest для одного run (использует кеш run:URL) ---
+// --- Lowest для одного run ---
 async function lowestFromRun(context, runUrl, precomputedT5Map = null) {
   const runCacheKey = `run:${runUrl}`;
   const cached = getC(runCacheKey);
@@ -285,6 +281,67 @@ async function lowestFromRun(context, runUrl, precomputedT5Map = null) {
   return out;
 }
 
+// ✅ общий процесс batch, чтобы не дублировать код (GET и POST используют одно и то же)
+async function processBatch(urls) {
+  const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
+  const context = await getContext();
+
+  // 1) отдаём кешированные run:URL
+  const results = new Array(clean.length).fill(null);
+  const todo = [];
+  for (let i = 0; i < clean.length; i++) {
+    const u = clean[i];
+    if (!u) {
+      results[i] = { ok: false, error: "empty url" };
+      continue;
+    }
+    const cached = getC(`run:${u}`);
+    if (cached) results[i] = cached;
+    else todo.push({ i, u });
+  }
+
+  if (!todo.length) return results;
+
+  // 2) roster параллельно
+  const rosterPacked = await mapLimit(todo, 10, async ({ i, u }) => {
+    try {
+      const roster = await fetchRunRoster(u);
+      return { i, u, ok: true, roster };
+    } catch (e) {
+      return { i, u, ok: false, error: String(e.message || e) };
+    }
+  });
+
+  // 3) дедуп персонажей и тянем timed5 ограниченной параллел.
+  const uniqueChars = new Map();
+  for (const r of rosterPacked) {
+    if (!r.ok) continue;
+    for (const c of r.roster) uniqueChars.set(charKey(c), c);
+  }
+
+  const t5Map = new Map();
+  await mapLimit(uniqueChars.values(), 4, async (c) => {
+    const v = await fetchTimed5(context, c.realm, c.name, c.region);
+    t5Map.set(charKey(c), v);
+  });
+
+  // 4) считаем lowest для каждого run
+  for (const r of rosterPacked) {
+    if (!r.ok) {
+      results[r.i] = { ok: false, error: r.error };
+      continue;
+    }
+    try {
+      const out = await lowestFromRun(context, r.u, t5Map);
+      results[r.i] = out;
+    } catch (e) {
+      results[r.i] = { ok: false, error: String(e.message || e) };
+    }
+  }
+
+  return results;
+}
+
 app.get("/health", (_, res) => res.json({ ok: true }));
 
 // одиночный GET
@@ -301,8 +358,7 @@ app.get("/lowest-from-run", async (req, res) => {
   }
 });
 
-// batch GET
-// /lowest-from-runs-get?urls=BASE64_WEBSAFE(JSON.stringify(["url1","url2"]))
+// batch GET (оставляем для совместимости, но он и будет упираться в URL length)
 app.get("/lowest-from-runs-get", async (req, res) => {
   try {
     const enc = req.query.urls;
@@ -320,64 +376,25 @@ app.get("/lowest-from-runs-get", async (req, res) => {
       return res.status(400).json({ ok: false, error: "urls must be array" });
     }
 
-    const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
+    const results = await processBatch(urls);
+    return res.json({ ok: true, results });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
 
-    const context = await getContext();
+// ✅ batch POST (главный, без лимита URL длины)
+app.post("/lowest-from-runs", async (req, res) => {
+  try {
+    const urls = Array.isArray(req.body) ? req.body : req.body?.urls;
 
-    // 1) сразу отдаём кешированные результаты для run:URL
-    const results = new Array(clean.length).fill(null);
-    const todo = [];
-    for (let i = 0; i < clean.length; i++) {
-      const u = clean[i];
-      if (!u) {
-        results[i] = { ok: false, error: "empty url" };
-        continue;
-      }
-      const cached = getC(`run:${u}`);
-      if (cached) results[i] = cached;
-      else todo.push({ i, u });
+    if (!Array.isArray(urls)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "body must be array or { urls: array }" });
     }
 
-    if (!todo.length) return res.json({ ok: true, results });
-
-    // 2) быстро собираем roster по всем run URL (параллельно, без Playwright)
-    const rosterPacked = await mapLimit(todo, 10, async ({ i, u }) => {
-      try {
-        const roster = await fetchRunRoster(u);
-        return { i, u, ok: true, roster };
-      } catch (e) {
-        return { i, u, ok: false, error: String(e.message || e) };
-      }
-    });
-
-    // 3) дедуп персонажей и предварительно тянем timed5 (ограниченная параллельность)
-    const uniqueChars = new Map();
-    for (const r of rosterPacked) {
-      if (!r.ok) continue;
-      for (const c of r.roster) uniqueChars.set(charKey(c), c);
-    }
-
-    const t5Map = new Map();
-    await mapLimit(uniqueChars.values(), 4, async (c) => {
-      const v = await fetchTimed5(context, c.realm, c.name, c.region);
-      t5Map.set(charKey(c), v);
-    });
-
-    // 4) считаем lowest для каждого run (уже без ожиданий Playwright)
-    for (const r of rosterPacked) {
-      if (!r.ok) {
-        results[r.i] = { ok: false, error: r.error };
-        continue;
-      }
-      try {
-        // используем precomputed map
-        const out = await lowestFromRun(context, r.u, t5Map);
-        results[r.i] = out;
-      } catch (e) {
-        results[r.i] = { ok: false, error: String(e.message || e) };
-      }
-    }
-
+    const results = await processBatch(urls);
     return res.json({ ok: true, results });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e.message || e) });
