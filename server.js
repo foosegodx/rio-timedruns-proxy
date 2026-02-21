@@ -7,8 +7,8 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "1mb" }));
 
-// ✅ bump версии кэша (чтобы warband пересчитался)
-const CACHE_VER = "v7";
+// ✅ bump версии кэша (чтобы warband пересчитался сразу)
+const CACHE_VER = "v8";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -333,22 +333,18 @@ function parseDiscordFromText(text) {
 // ----- WAR BAND helpers -----
 
 async function detectHasWarband(page) {
-  try {
-    const n = await page
-      .locator('a:has-text("Warband"), button:has-text("Warband"), [role="tab"]:has-text("Warband")')
-      .count();
-    if (n > 0) return true;
-  } catch {}
-
-  try {
-    const has = await page.evaluate(() => /\bwarband\b/i.test(document.body?.innerText || ""));
-    return !!has;
-  } catch {
-    return false;
-  }
+  // максимально надёжно: смотрим реальные элементы интерфейса
+  return await page
+    .evaluate(() => {
+      const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const els = Array.from(document.querySelectorAll("a,button,[role='tab']"));
+      return els.some((el) => norm(el.textContent).includes("warband"));
+    })
+    .catch(() => false);
 }
 
 async function findWarbandUrlFromPage(page) {
+  // 1) href в DOM
   const href = await page
     .evaluate(() => {
       const abs = (raw) => {
@@ -382,6 +378,7 @@ async function findWarbandUrlFromPage(page) {
 
   if (href) return href;
 
+  // 2) иногда ссылка прячется в __NEXT_DATA__ / script json
   const fromScripts = await page
     .evaluate(() => {
       const abs = (raw) => {
@@ -391,8 +388,8 @@ async function findWarbandUrlFromPage(page) {
         return null;
       };
 
-      const candidates = new Set();
       const re = /"((?:\/)[^"\\]*warband[^"\\]*)"/gi;
+      const candidates = new Set();
 
       const scripts = Array.from(document.querySelectorAll("script"));
       for (const s of scripts) {
@@ -445,7 +442,7 @@ async function findWarbandUrlFromPage(page) {
 async function fetchWarbandUrl(context, region, realm, name) {
   const ck = wbKey(region, realm, name);
   const cached = getC(ck);
-  if (cached !== null) return cached; // string | null
+  if (cached !== null) return cached; // string|null
 
   const profileUrl = `https://raider.io/characters/${region}/${encodeURIComponent(realm)}/${encodeURIComponent(
     name
@@ -464,7 +461,7 @@ async function fetchWarbandUrl(context, region, realm, name) {
       return null;
     }
 
-    // 1) без клика
+    // 1) пробуем добыть реальный URL
     let url = await findWarbandUrlFromPage(page);
     if (url) {
       setC(ck, url);
@@ -472,21 +469,11 @@ async function fetchWarbandUrl(context, region, realm, name) {
     }
 
     // 2) клик по Warband и повтор
-    const before = page.url();
     await page
       .locator('a:has-text("Warband"), button:has-text("Warband"), [role="tab"]:has-text("Warband")')
       .first()
       .click({ timeout: 6000 })
       .catch(() => {});
-
-    for (let i = 0; i < 10; i++) {
-      await page.waitForTimeout(300);
-      const after = page.url();
-      if (after && after !== before && /warband/i.test(after)) {
-        setC(ck, after);
-        return after;
-      }
-    }
 
     url = await findWarbandUrlFromPage(page);
     if (url) {
@@ -494,7 +481,7 @@ async function fetchWarbandUrl(context, region, realm, name) {
       return url;
     }
 
-    // 3) Warband есть, но URL не найден (SPA) — даём fallback-ссылку
+    // 3) если warband есть, но URL не выдаётся (SPA) — отдаём fallback (чтобы G не была пустой)
     const fallback = profileUrl + "?tab=warband";
     setC(ck, fallback);
     return fallback;
