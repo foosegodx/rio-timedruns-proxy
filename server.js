@@ -16,11 +16,16 @@ const UA =
   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 // ---- НАСТРОЙКИ СТАБИЛЬНОСТИ ----
-const RUN_TIMEOUT_MS = 70_000;        // общий бюджет на 1 run (мы внутри вернем partial, если не успели)
+const RUN_TIMEOUT_MS = 70_000;        // бюджет на 1 run (внутри вернём partial, если не успели)
 const INFLIGHT_STALE_MS = 3 * 60_000; // если "в работе" > 3 мин — считаем зависшим
 const WORKER_BATCH = 4;               // сколько run-ов брать за раз из очереди
-const WORKER_PARALLEL = 2;            // сколько run-ов считать параллельно в воркере
-const PER_RUN_PARALLEL = 2;           // сколько персонажей параллельно внутри 1 run
+
+// ✅ ВАЖНО: ставим 1 для стабильности. Потом можно попробовать 2.
+const WORKER_PARALLEL = 1;
+
+// в lowestFromRun сейчас последовательный обход участников, PER_RUN_PARALLEL не используется,
+// но оставим на будущее
+const PER_RUN_PARALLEL = 2;
 
 // если partial — попробуем дорефайнить позже (пару раз)
 const PARTIAL_RETRY_MAX = 2;
@@ -30,6 +35,7 @@ const partialAttempts = new Map(); // runUrl -> attempts
 function now() {
   return Date.now();
 }
+
 function getC(k) {
   const v = cache.get(k);
   if (!v) return null;
@@ -39,6 +45,7 @@ function getC(k) {
   }
   return v.val;
 }
+
 function setC(k, val, ttlMs = TTL_MS) {
   cache.set(k, { val, exp: now() + ttlMs });
 }
@@ -62,7 +69,7 @@ function normalizeRealm(realmRaw) {
 function normalizeRegion(regionRaw) {
   if (!regionRaw) return "";
   const s = String(
-    typeof regionRaw === "object" ? (regionRaw.slug || regionRaw.name || "") : regionRaw
+    typeof regionRaw === "object" ? (regionRaw.slug || realmRaw?.name || "") : regionRaw
   )
     .toLowerCase()
     .trim();
@@ -95,9 +102,19 @@ async function mapLimit(items, limit, fn) {
   return out;
 }
 
+function isBrowserClosedError(msg) {
+  const s = String(msg || "");
+  return /Target page, context or browser has been closed|Target closed|browser has disconnected|Protocol error/i.test(
+    s
+  );
+}
+
 // --- Playwright singleton ---
 let browserPromise = null;
 let contextPromise = null;
+
+// ✅ lock, чтобы reset не запускался одновременно
+let resetLock = null;
 
 async function resetBrowser() {
   try {
@@ -108,6 +125,18 @@ async function resetBrowser() {
   } catch {}
   browserPromise = null;
   contextPromise = null;
+}
+
+async function ensureResetBrowser() {
+  if (resetLock) return resetLock;
+  resetLock = (async () => {
+    await resetBrowser();
+  })();
+  try {
+    await resetLock;
+  } finally {
+    resetLock = null;
+  }
 }
 
 async function getContext() {
@@ -234,6 +263,7 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
   for (const r of regions) if (!tryRegions.includes(r)) tryRegions.push(r);
 
   for (const region of tryRegions) {
+    // если контекст умер — этот вызов упадёт и улетит в воркер catch
     const page = await context.newPage();
     page.setDefaultTimeout(15000);
     page.setDefaultNavigationTimeout(15000);
@@ -268,11 +298,10 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
 }
 
 /**
- * ✅ ВАЖНО: теперь lowestFromRun НИКОГДА не кидает run_timeout наружу.
- * Он сам:
- *  - имеет дедлайн (RUN_TIMEOUT_MS - запас)
- *  - успел посчитать часть игроков -> вернет partial:true
- *  - успел всех -> partial:false
+ * partial вместо run_timeout:
+ * - есть дедлайн
+ * - успели часть -> partial:true
+ * - успели всех -> partial:false
  */
 async function lowestFromRun(context, runUrl) {
   const runCacheKey = `run:${runUrl}`;
@@ -281,12 +310,10 @@ async function lowestFromRun(context, runUrl) {
 
   const roster = await fetchRunRoster(runUrl);
 
-  const deadline = Date.now() + (RUN_TIMEOUT_MS - 3000); // 3 сек запас
+  const deadline = Date.now() + (RUN_TIMEOUT_MS - 3000);
   let best = null;
   let done = 0;
 
-  // последовательно по игрокам, чтобы гарантировать хоть какой-то результат
-  // (пер-рун параллелизм мы оставим в воркере/очереди)
   for (const p of roster) {
     if (Date.now() > deadline) break;
 
@@ -309,7 +336,6 @@ async function lowestFromRun(context, runUrl) {
       }
     : { ok: false, error: "no timed totals found", partial: true };
 
-  // Если partial — кэшируем на меньшее время, чтобы можно было дозавершить позже
   setC(runCacheKey, out, partial ? 20 * 60 * 1000 : TTL_MS);
   return out;
 }
@@ -319,8 +345,7 @@ async function lowestFromRun(context, runUrl) {
    ======================= */
 const runQueue = [];
 const queued = new Set();
-// inflight: url -> startedAt
-const inflight = new Map();
+const inflight = new Map(); // url -> startedAt
 let workerRunning = false;
 let lastProgressAt = now();
 
@@ -333,7 +358,6 @@ function enqueueRuns(urls, force = false) {
     const cached = getC(`run:${u}`);
     if (cached && cached.ok && !cached.partial && !force) continue;
 
-    // если inflight завис — переочередим
     const startedAt = inflight.get(u);
     if (startedAt && t - startedAt > INFLIGHT_STALE_MS) {
       inflight.delete(u);
@@ -367,7 +391,6 @@ async function startWorker() {
           setC(`run:${u}`, out, out.partial ? 20 * 60 * 1000 : TTL_MS);
           lastProgressAt = now();
 
-          // если partial — попробуем дорефайнить (пару раз)
           if (out.ok && out.partial) {
             const n = partialAttempts.get(u) || 0;
             if (n < PARTIAL_RETRY_MAX) {
@@ -378,13 +401,17 @@ async function startWorker() {
         } catch (e) {
           const msg = String(e?.message || e);
 
-          // если Playwright умер — сбросим браузер
-          if (/Target closed|browser has disconnected|Protocol error/i.test(msg)) {
-            await resetBrowser();
+          // ✅ если браузер/контекст закрыт — НЕ кэшируем это как результат
+          // просто сбрасываем браузер и переочередим этот run
+          if (isBrowserClosedError(msg)) {
+            await ensureResetBrowser();
             context = await getContext();
+            // переочередим чуть позже
+            setTimeout(() => enqueueRuns([u], true), 2000);
+          } else {
+            setC(`run:${u}`, { ok: false, error: msg, partial: true }, 10 * 60 * 1000);
           }
 
-          setC(`run:${u}`, { ok: false, error: msg, partial: true }, 10 * 60 * 1000);
           lastProgressAt = now();
         } finally {
           inflight.delete(u);
@@ -394,7 +421,6 @@ async function startWorker() {
   })()
     .catch(async (e) => {
       console.error("worker fatal:", e);
-      // если воркер упал — вернем inflight обратно в очередь
       for (const [u] of inflight.entries()) {
         inflight.delete(u);
         if (!queued.has(u)) {
@@ -402,7 +428,7 @@ async function startWorker() {
           runQueue.push(u);
         }
       }
-      await resetBrowser();
+      await ensureResetBrowser();
     })
     .finally(() => {
       workerRunning = false;
@@ -423,7 +449,7 @@ setInterval(() => {
       }
     }
     workerRunning = false;
-    resetBrowser().finally(() => startWorker());
+    ensureResetBrowser().finally(() => startWorker());
   }
 }, 30_000);
 
@@ -445,9 +471,17 @@ function processBatchFast(urls) {
     }
 
     const cached = getC(`run:${u}`);
+
     if (cached) {
-      results[i] = cached;
-      if (cached.ok && cached.partial) needRefine.push(u); // дозавершим в фоне
+      // ✅ если в кэше лежит "browser closed" — удаляем и считаем как PENDING
+      if (!cached.ok && isBrowserClosedError(cached.error)) {
+        cache.delete(`run:${u}`);
+        results[i] = { ok: false, error: "PENDING", partial: true };
+        missing.push(u);
+      } else {
+        results[i] = cached;
+        if (cached.ok && cached.partial) needRefine.push(u);
+      }
     } else {
       results[i] = { ok: false, error: "PENDING", partial: true };
       missing.push(u);
