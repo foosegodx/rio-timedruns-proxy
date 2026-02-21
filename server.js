@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: "1mb" }));
 
 // ✅ bump версии кэша (чтобы сразу пересчитать warband)
-const CACHE_VER = "v4";
+const CACHE_VER = "v5";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -31,8 +31,8 @@ const PARTIAL_RETRY_MAX = 2;
 const PARTIAL_RETRY_DELAY_MS = 30_000;
 const partialAttempts = new Map(); // runUrl -> attempts
 
-// отдельный лимит на попытку добыть warband ссылку (чтобы не зависать)
-const WAR_BAND_TIMEOUT_MS = 12_000;
+// лимит на warband (чтобы не зависать)
+const WAR_BAND_TIMEOUT_MS = 15_000;
 
 const runKey = (u) => `run:${CACHE_VER}:${u}`;
 const ttKey = (regionHint, realm, name) =>
@@ -381,12 +381,44 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
   return null;
 }
 
-/**
- * ✅ Получение warband URL:
- * 1) Если на странице есть вкладка Warband и у неё есть href -> возвращаем href
- * 2) Иначе кликаем по вкладке Warband и берём page.url()
- * Если вкладки нет — null
- */
+// ---------- WAR BAND ----------
+
+async function findWarbandHref(page) {
+  try {
+    return await page.evaluate(() => {
+      const abs = (raw) => {
+        if (!raw) return null;
+        if (/^https?:\/\//i.test(raw)) return raw;
+        return new URL(raw, location.origin).toString();
+      };
+
+      // 1) если где-то есть явная ссылка с warband
+      const a1 = Array.from(document.querySelectorAll("a[href]")).find((a) =>
+        /warband/i.test(a.getAttribute("href") || "")
+      );
+      if (a1) return abs(a1.getAttribute("href"));
+
+      // 2) ищем элемент таба/кнопки по тексту и пробуем вытащить href/to/data-*
+      const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const els = Array.from(document.querySelectorAll("a,button,[role='tab']"));
+      const hit = els.find((el) => norm(el.textContent).includes("warband"));
+      if (!hit) return null;
+
+      const a = hit.closest("a");
+      const raw =
+        (a && a.getAttribute("href")) ||
+        hit.getAttribute("href") ||
+        hit.getAttribute("to") ||
+        (hit.dataset && (hit.dataset.href || hit.dataset.to || hit.dataset.url)) ||
+        null;
+
+      return abs(raw);
+    });
+  } catch {
+    return null;
+  }
+}
+
 async function fetchWarbandUrl(context, region, realm, name) {
   const ck = wbKey(region, realm, name);
   const cached = getC(ck);
@@ -403,56 +435,82 @@ async function fetchWarbandUrl(context, region, realm, name) {
   try {
     await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
 
-    // ждём появления табов
-    try {
-      await page.waitForSelector('text=/Warband/i', { timeout: 6000 });
-    } catch {
+    const tab = page
+      .locator('a:has-text("Warband"), button:has-text("Warband"), [role="tab"]:has-text("Warband")')
+      .first();
+
+    if ((await tab.count()) === 0) {
       setC(ck, null);
       return null;
     }
 
-    // 1) пробуем получить href без клика
-    const href = await page.evaluate(() => {
-      const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
-      const els = Array.from(document.querySelectorAll("a,[role='tab'],button"));
-      const hit = els.find((el) => norm(el.textContent).includes("warband"));
-      if (!hit) return null;
-
-      const a = hit.closest("a");
-      const raw = (a && a.getAttribute("href")) || hit.getAttribute("href") || null;
-      if (!raw) return null;
-
-      if (/^https?:\/\//i.test(raw)) return raw;
-      return new URL(raw, location.origin).toString();
-    });
-
+    // A) сначала пробуем найти href без клика
+    let href = await findWarbandHref(page);
     if (href) {
       setC(ck, href);
       return href;
     }
 
-    // 2) кликаем и ждём изменения URL
+    // B) кликаем Warband и снова пытаемся найти href/URL
     const before = page.url();
 
-    const tab = page.locator('a:has-text("Warband"), [role="tab"]:has-text("Warband"), button:has-text("Warband")').first();
-    await tab.click({ timeout: 5000 });
-
-    // ждём, что URL изменится или начнёт содержать "warband"
     try {
-      await page.waitForFunction(
-        (u) => location.href !== u || /warband/i.test(location.href),
-        before,
-        { timeout: 8000 }
-      );
+      await tab.click({ timeout: 6000 });
+    } catch {
+      // если клик не удался — всё равно попробуем угадать
+    }
+
+    // ждём потенциальной навигации/смены url
+    try {
+      await page.waitForURL(/warband/i, { timeout: 6000 });
     } catch (_) {}
 
+    href = await findWarbandHref(page);
+    if (href) {
+      setC(ck, href);
+      return href;
+    }
+
+    // canonical / og:url иногда меняются при табах
+    const metaUrl = await page.evaluate(() => {
+      const canon = document.querySelector('link[rel="canonical"]')?.href || null;
+      const og = document.querySelector('meta[property="og:url"]')?.content || null;
+      return canon || og || null;
+    });
+    if (metaUrl && /warband/i.test(metaUrl)) {
+      setC(ck, metaUrl);
+      return metaUrl;
+    }
+
     const after = page.url();
-    if (after && after !== before) {
+    if (after && after !== before && /warband/i.test(after)) {
       setC(ck, after);
       return after;
     }
 
-    // бывает SPA без изменения URL — тогда warband URL неоткуда взять
+    // C) если SPA не меняет URL — пробуем самые частые шаблоны
+    const candidates = [
+      `${profileUrl}/warband`,
+      `${profileUrl}?view=warband`,
+      `${profileUrl}?tab=warband`,
+      `${profileUrl}#warband`,
+    ];
+
+    for (const cand of candidates) {
+      try {
+        const resp = await page.goto(cand, { waitUntil: "domcontentloaded", timeout: 8000 });
+        if (resp && resp.ok()) {
+          const finalUrl = page.url();
+          if (/warband/i.test(finalUrl) || /warband/i.test(cand)) {
+            setC(ck, finalUrl);
+            return finalUrl;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
     setC(ck, null);
     return null;
   } catch {
@@ -499,7 +557,7 @@ async function lowestFromRun(context, runUrl) {
     best.p.realm
   )}/${encodeURIComponent(best.p.name)}`;
 
-  // ✅ warband только для выбранного "lowest" (чтобы не тормозить на всех)
+  // ✅ warband только для выбранного lowest
   let warband_url = null;
   try {
     warband_url = await withTimeout(
@@ -631,62 +689,6 @@ setInterval(() => {
 }, 30_000);
 
 /* =======================
-   Batch endpoints
-   ======================= */
-function processBatchFast(urls) {
-  const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
-
-  const results = new Array(clean.length);
-  const missing = [];
-  const needRefine = [];
-
-  for (let i = 0; i < clean.length; i++) {
-    const u = clean[i];
-    if (!u) {
-      results[i] = { ok: false, error: "empty url", partial: true };
-      continue;
-    }
-
-    const cached = getC(runKey(u));
-
-    if (cached) {
-      if (!cached.ok && isBrowserClosedError(cached.error)) {
-        cache.delete(runKey(u));
-        results[i] = { ok: false, error: "PENDING", partial: true };
-        missing.push(u);
-      } else {
-        results[i] = cached;
-        if (cached.ok && cached.partial) needRefine.push(u);
-      }
-    } else {
-      results[i] = { ok: false, error: "PENDING", partial: true };
-      missing.push(u);
-    }
-  }
-
-  if (missing.length) enqueueRuns(missing);
-  if (needRefine.length) enqueueRuns(needRefine, true);
-
-  return results;
-}
-
-async function processBatchFull(urls) {
-  const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
-  const context = await getContext();
-
-  const out = await mapLimit(clean, 2, async (u) => {
-    if (!u) return { ok: false, error: "empty url", partial: true };
-    try {
-      return await lowestFromRun(context, u);
-    } catch (e) {
-      return { ok: false, error: String(e.message || e), partial: true };
-    }
-  });
-
-  return out;
-}
-
-/* =======================
    Routes
    ======================= */
 app.get("/health", (_, res) => res.json({ ok: true }));
@@ -739,6 +741,59 @@ app.get("/lowest-from-runs-get", async (req, res) => {
     return res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
+
+function processBatchFast(urls) {
+  const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
+
+  const results = new Array(clean.length);
+  const missing = [];
+  const needRefine = [];
+
+  for (let i = 0; i < clean.length; i++) {
+    const u = clean[i];
+    if (!u) {
+      results[i] = { ok: false, error: "empty url", partial: true };
+      continue;
+    }
+
+    const cached = getC(runKey(u));
+
+    if (cached) {
+      if (!cached.ok && isBrowserClosedError(cached.error)) {
+        cache.delete(runKey(u));
+        results[i] = { ok: false, error: "PENDING", partial: true };
+        missing.push(u);
+      } else {
+        results[i] = cached;
+        if (cached.ok && cached.partial) needRefine.push(u);
+      }
+    } else {
+      results[i] = { ok: false, error: "PENDING", partial: true };
+      missing.push(u);
+    }
+  }
+
+  if (missing.length) enqueueRuns(missing);
+  if (needRefine.length) enqueueRuns(needRefine, true);
+
+  return results;
+}
+
+async function processBatchFull(urls) {
+  const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
+  const context = await getContext();
+
+  const out = await mapLimit(clean, 2, async (u) => {
+    if (!u) return { ok: false, error: "empty url", partial: true };
+    try {
+      return await lowestFromRun(context, u);
+    } catch (e) {
+      return { ok: false, error: String(e.message || e), partial: true };
+    }
+  });
+
+  return out;
+}
 
 app.post("/lowest-from-runs", async (req, res) => {
   try {
