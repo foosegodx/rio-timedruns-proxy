@@ -58,32 +58,12 @@ function normalizeRegion(regionRaw) {
   return "";
 }
 
-// устойчивый парсер 5+ Timed Runs
-function parseTimed5(text) {
-  const t = String(text || "").replace(/\u00a0/g, " ");
-
-  // число слева
-  let m = t.match(/(\d[\d,]*)\s+5\+\s+Keystone\s+Timed\s+Runs/i);
-  if (m) return Number(String(m[1]).replace(/,/g, ""));
-
-  // число справа
-  m = t.match(/5\+\s+Keystone\s+Timed\s+Runs\s+(\d[\d,]*)/i);
-  if (m) return Number(String(m[1]).replace(/,/g, ""));
-
-  m = t.match(/(\d[\d,]*)\s+5\+\s+Timed\s+Runs/i);
-  if (m) return Number(String(m[1]).replace(/,/g, ""));
-
-  m = t.match(/5\+\s+Timed\s+Runs\s+(\d[\d,]*)/i);
-  if (m) return Number(String(m[1]).replace(/,/g, ""));
-
-  const idx = t.toLowerCase().indexOf("timed runs");
-  if (idx !== -1) {
-    const slice = t.slice(Math.max(0, idx - 250), idx + 250);
-    m = slice.match(/(\d[\d,]*)\s+5\+/i);
-    if (m) return Number(String(m[1]).replace(/,/g, ""));
-  }
-
-  return null;
+// base64 websafe (Apps Script) -> utf8 (для legacy GET)
+function decodeBase64WebSafeToUtf8(enc) {
+  const s = String(enc || "");
+  let b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (b64.length % 4) b64 += "=";
+  return Buffer.from(b64, "base64").toString("utf8");
 }
 
 // --- лимитер параллелизма ---
@@ -122,6 +102,7 @@ async function getContext() {
     const browser = await browserPromise;
     const context = await browser.newContext({ userAgent: UA });
 
+    // режем лишнее
     await context.route("**/*", (route) => {
       const rt = route.request().resourceType();
       if (!["document", "script", "xhr", "fetch"].includes(rt)) return route.abort();
@@ -146,7 +127,7 @@ async function shutdown() {
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
-// --- run-details roster ---
+// --- Raider.IO run-details roster ---
 async function fetchRunRoster(runUrl) {
   const m = String(runUrl).match(/\/mythic-plus-runs\/(season-[^/]+)\/(\d+)-/i);
   if (!m) throw new Error("Bad URL");
@@ -193,11 +174,52 @@ async function fetchRunRoster(runUrl) {
   return roster;
 }
 
-// --- timed5 по персонажу ---
-async function fetchTimed5(context, realm, name, regionHint) {
-  const ck = `t5:${(regionHint || "").toLowerCase()}:${realm}:${name}`.toLowerCase();
+/**
+ * ✅ Парсим ВСЕ "X+ Keystone Timed Runs" и достаём числа.
+ * Возвращает:
+ *  { total: number, by: { "5+": 20, "10+": 272, ... } }
+ * или null, если не нашли ни одной плитки.
+ *
+ * Поддерживает оба порядка:
+ *  "270 15+ Keystone Timed Runs"
+ *  "15+ Keystone Timed Runs 270"
+ */
+function parseTimedRunsAll(text) {
+  const t = String(text || "").replace(/\u00a0/g, " ");
+
+  const by = {};
+
+  const p1 = /(\d[\d,]*)\s+(\d{1,2}\+)\s+Keystone\s+Timed\s+Runs/gi;
+  const p2 = /(\d{1,2}\+)\s+Keystone\s+Timed\s+Runs\s+(\d[\d,]*)/gi;
+
+  let m;
+  while ((m = p1.exec(t)) !== null) {
+    const count = Number(String(m[1]).replace(/,/g, ""));
+    const level = m[2];
+    if (Number.isFinite(count)) by[level] = Math.max(by[level] || 0, count);
+  }
+  while ((m = p2.exec(t)) !== null) {
+    const level = m[1];
+    const count = Number(String(m[2]).replace(/,/g, ""));
+    if (Number.isFinite(count)) by[level] = Math.max(by[level] || 0, count);
+  }
+
+  const keys = Object.keys(by);
+  if (!keys.length) return null;
+
+  const total = keys.reduce((s, k) => s + (by[k] || 0), 0);
+  return { total, by };
+}
+
+/**
+ * ✅ Получаем TOTAL (сумму всех плиток) для персонажа.
+ * Возвращает:
+ *  { total, by } или null (если вообще не нашли статистику).
+ */
+async function fetchTimedTotal(context, realm, name, regionHint) {
+  const ck = `tt:${(regionHint || "").toLowerCase()}:${realm}:${name}`.toLowerCase();
   const cached = getC(ck);
-  if (cached !== null) return cached;
+  if (cached !== null) return cached; // объект или null
 
   const tryRegions = [];
   if (regionHint && regions.includes(regionHint)) tryRegions.push(regionHint);
@@ -215,23 +237,17 @@ async function fetchTimed5(context, realm, name, regionHint) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
 
-      let txt = null;
+      // ждём, пока появится блок со словами "Keystone Timed Runs" (если он вообще есть)
       try {
-        const loc = page.locator("text=/5\\+\\s+Keystone\\s+Timed\\s+Runs/i").first();
-        await loc.waitFor({ timeout: 4000 });
-        txt = await loc.textContent({ timeout: 2000 });
-      } catch {}
+        await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 6000 });
+      } catch (_) {}
 
-      let v = txt ? parseTimed5(txt) : null;
+      const bodyText = await page.evaluate(() => document.body?.innerText || "");
+      const parsed = parseTimedRunsAll(bodyText);
 
-      if (v === null) {
-        const bodyText = await page.evaluate(() => document.body?.innerText || "");
-        v = parseTimed5(bodyText);
-      }
-
-      if (typeof v === "number" && Number.isFinite(v)) {
-        setC(ck, v);
-        return v;
+      if (parsed) {
+        setC(ck, parsed);
+        return parsed;
       }
     } catch {
       // ignore
@@ -240,11 +256,12 @@ async function fetchTimed5(context, realm, name, regionHint) {
     }
   }
 
+  // статистику не нашли ни в одном регионе
   setC(ck, null);
   return null;
 }
 
-// ✅ Lowest для одного run (null считаем как 0)
+// ✅ Lowest для одного run: сравниваем по total (сумме)
 async function lowestFromRun(context, runUrl) {
   const runCacheKey = `run:${runUrl}`;
   const cached = getC(runCacheKey);
@@ -252,22 +269,27 @@ async function lowestFromRun(context, runUrl) {
 
   const roster = await fetchRunRoster(runUrl);
 
-  // параллелим timed5 внутри 1 run, но аккуратно (чтобы не убить память)
-  const t5List = await mapLimit(roster, 3, async (p) => {
-    const v = await fetchTimed5(context, p.realm, p.name, p.region);
-    return { p, t5: v === null ? 0 : v };
+  // получаем totals по участникам (немного параллелим)
+  const totals = await mapLimit(roster, 3, async (p) => {
+    const stat = await fetchTimedTotal(context, p.realm, p.name, p.region);
+    return { p, stat }; // stat = {total, by} или null
   });
 
+  // выбираем минимальный total среди тех, у кого stat найден
   let best = null;
-  for (const it of t5List) {
-    if (!best || it.t5 < best.t5) best = it;
+  for (const it of totals) {
+    if (!it.stat) continue; // если не нашли вообще — не используем, чтобы не выбрать случайно
+    if (!best || it.stat.total < best.stat.total) best = it;
   }
 
-  const out = {
-    ok: true,
-    lowest: `${best.p.name}-${best.p.realm}`.toLowerCase(),
-    timed5: best.t5,
-  };
+  const out = best
+    ? {
+        ok: true,
+        lowest: `${best.p.name}-${best.p.realm}`.toLowerCase(),
+        timed_total: best.stat.total,
+        timed_breakdown: best.stat.by,
+      }
+    : { ok: false, error: "no timed totals found" };
 
   setC(runCacheKey, out);
   return out;
@@ -285,7 +307,7 @@ function enqueueRuns(urls) {
   for (const u0 of urls) {
     const u = String(u0 || "").trim();
     if (!u) continue;
-    if (getC(`run:${u}`)) continue;        // уже готово
+    if (getC(`run:${u}`)) continue;
     if (queued.has(u) || inflight.has(u)) continue;
     queued.add(u);
     runQueue.push(u);
@@ -301,14 +323,12 @@ async function startWorker() {
     const context = await getContext();
 
     while (runQueue.length) {
-      // берем небольшими пачками
       const batch = runQueue.splice(0, 6);
       for (const u of batch) {
         queued.delete(u);
         inflight.add(u);
       }
 
-      // считаем ограниченной параллельностью
       await mapLimit(batch, 2, async (u) => {
         try {
           await lowestFromRun(context, u);
@@ -323,14 +343,10 @@ async function startWorker() {
     .catch((e) => console.error("worker fatal:", e))
     .finally(() => {
       workerRunning = false;
-      // если пока работали добавили ещё — запустимся снова
       if (runQueue.length) startWorker();
     });
 }
 
-/* =========================================================
-   Batch FAST / FULL
-   ========================================================= */
 function processBatchFast(urls) {
   const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
 
@@ -351,9 +367,7 @@ function processBatchFast(urls) {
     }
   }
 
-  // ✅ добавляем в очередь и сразу отдаём ответ
   if (missing.length) enqueueRuns(missing);
-
   return results;
 }
 
@@ -361,7 +375,6 @@ async function processBatchFull(urls) {
   const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
   const context = await getContext();
 
-  // считаем всё до конца (для ручной отладки, не для Sheets)
   const out = await mapLimit(clean, 2, async (u) => {
     if (!u) return { ok: false, error: "empty url" };
     try {
@@ -379,7 +392,7 @@ async function processBatchFull(urls) {
    ========================================================= */
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// ✅ смотреть прогресс
+// прогресс очереди
 app.get("/debug", (_, res) => {
   res.json({
     ok: true,
@@ -391,7 +404,7 @@ app.get("/debug", (_, res) => {
   });
 });
 
-// одиночный GET (для проверки)
+// одиночный GET (проверка)
 app.get("/lowest-from-run", async (req, res) => {
   const runUrl = req.query.url;
   if (!runUrl) return res.status(400).json({ ok: false, error: "missing url" });
@@ -405,7 +418,7 @@ app.get("/lowest-from-run", async (req, res) => {
   }
 });
 
-// batch GET (legacy)
+// legacy GET
 app.get("/lowest-from-runs-get", async (req, res) => {
   try {
     const enc = req.query.urls;
@@ -430,7 +443,7 @@ app.get("/lowest-from-runs-get", async (req, res) => {
   }
 });
 
-// ✅ batch POST: по умолчанию FAST, можно ?full=1
+// основной POST: fast по умолчанию, full=1 для ручной отладки
 app.post("/lowest-from-runs", async (req, res) => {
   try {
     const full = String(req.query.full || "") === "1";
