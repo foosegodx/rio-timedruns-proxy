@@ -7,8 +7,8 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "1mb" }));
 
-// ✅ bump версии кэша (меняй на v3 если захочешь сбросить кэш ещё раз)
-const CACHE_VER = "v2";
+// ✅ bump версии кэша (чтобы сразу пересчитать warband/discord)
+const CACHE_VER = "v3";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -19,8 +19,8 @@ const UA =
   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 // ---- НАСТРОЙКИ ----
-const RUN_TIMEOUT_MS = 140_000;        // бюджет на 1 run (partial если не успели)
-const INFLIGHT_STALE_MS = 3 * 70_000; // inflight > 3 мин => считаем зависшим
+const RUN_TIMEOUT_MS = 140_000;
+const INFLIGHT_STALE_MS = 3 * 70_000;
 
 // скорость
 const WORKER_BATCH = 6;
@@ -113,8 +113,6 @@ function isBrowserClosedError(msg) {
 // --- Playwright singleton ---
 let browserPromise = null;
 let contextPromise = null;
-
-// lock, чтобы reset не запускался одновременно
 let resetLock = null;
 
 async function resetBrowser() {
@@ -178,7 +176,7 @@ async function shutdown() {
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
-// --- run-details roster ---
+// --- Raider.IO run-details roster ---
 async function fetchRunRoster(runUrl) {
   const m = String(runUrl).match(/\/mythic-plus-runs\/(season-[^/]+)\/(\d+)-/i);
   if (!m) throw new Error("Bad URL");
@@ -225,9 +223,7 @@ async function fetchRunRoster(runUrl) {
   return roster;
 }
 
-/**
- * Парсим все "X+ Keystone Timed Runs" и суммируем.
- */
+// --- Timed Runs total ---
 function parseTimedRunsAll(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const by = {};
@@ -254,19 +250,13 @@ function parseTimedRunsAll(text) {
   return { total, by };
 }
 
-/**
- * ✅ Discord из Contact Info:
- * - если есть BattleTag (#1234) -> Discord = следующая строка (может быть без #)
- * - если BattleTag НЕТ -> берём первую строку, похожую на discord username (БЕЗ #)
- * - отсекаем стоп-слова вроде "Loadout"
- */
+// --- Discord from Contact Info (без Loadout) ---
 function parseDiscordFromText(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const idx = t.toLowerCase().indexOf("contact info");
   if (idx === -1) return null;
 
   let slice = t.slice(idx, idx + 2200);
-
   const cut = slice.search(/\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs)\b/i);
   if (cut > 0) slice = slice.slice(0, cut);
 
@@ -276,8 +266,8 @@ function parseDiscordFromText(text) {
     .filter((s) => s && s.toLowerCase() !== "contact info");
 
   const btRe = /#\d{4}\b/;
-  const discordNewRe = /^[\p{L}\p{N}_.-]{2,32}$/u;       // kaasklomp / deaqaze
-  const discordOldRe = /^[\p{L}\p{N}_.-]{2,32}#\d{4}$/u; // Méq#6588
+  const discordNewRe = /^[\p{L}\p{N}_.-]{2,32}$/u;
+  const discordOldRe = /^[\p{L}\p{N}_.-]{2,32}#\d{4}$/u;
 
   const stop = new Set([
     "loadout",
@@ -299,7 +289,6 @@ function parseDiscordFromText(text) {
 
   const btIdx = lines.findIndex((l) => btRe.test(l));
 
-  // Есть BattleTag -> discord обычно следующая строка
   if (btIdx !== -1) {
     for (let i = btIdx + 1; i < lines.length; i++) {
       const cand = lines[i];
@@ -310,7 +299,7 @@ function parseDiscordFromText(text) {
     return null;
   }
 
-  // Нет BattleTag -> берём только "новый" discord без #
+  // нет BattleTag -> берём только новый Discord (без #)
   for (const cand of lines) {
     if (/^https?:\/\//i.test(cand)) continue;
     if (isStopWord(cand)) continue;
@@ -320,13 +309,53 @@ function parseDiscordFromText(text) {
   return null;
 }
 
+// --- Warband link extraction (DOM) ---
+async function extractWarbandUrl(page) {
+  try {
+    const href = await page.evaluate(() => {
+      const norm = (s) => (s || "").trim().toLowerCase();
+
+      // чаще всего это <a> в табах
+      const a = Array.from(document.querySelectorAll("a")).find(
+        (el) => norm(el.textContent) === "warband"
+      );
+      if (a && a.href) return a.href;
+
+      // иногда это роль tab/button
+      const el = Array.from(document.querySelectorAll('a,[role="tab"],button')).find(
+        (x) => norm(x.textContent) === "warband"
+      );
+      if (!el) return null;
+
+      const raw =
+        el.getAttribute("href") ||
+        (el.dataset && (el.dataset.href || el.dataset.url)) ||
+        null;
+
+      if (!raw) return null;
+
+      if (/^https?:\/\//i.test(raw)) return raw;
+      return new URL(raw, location.origin).toString();
+    });
+
+    if (!href) return null;
+
+    // нормализуем на всякий случай
+    if (/^https?:\/\/raider\.io\//i.test(href)) return href;
+    if (href.startsWith("/")) return `https://raider.io${href}`;
+    return href;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * ✅ Возвращает { total, by, regionUsed, discord } или null
+ * ✅ Возвращает { total, by, regionUsed, discord, warband_url } или null
  */
 async function fetchTimedTotal(context, realm, name, regionHint) {
   const ck = ttKey(regionHint, realm, name);
   const cached = getC(ck);
-  if (cached !== null) return cached; // объект или null
+  if (cached !== null) return cached;
 
   const tryRegions = [];
   if (regionHint && regions.includes(regionHint)) tryRegions.push(regionHint);
@@ -344,6 +373,7 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
 
+      // ждём чтобы табы/контент успели появиться
       try {
         await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 6000 });
       } catch (_) {}
@@ -356,7 +386,15 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
 
       if (parsed) {
         const discord = parseDiscordFromText(bodyText);
-        const out = { ...parsed, regionUsed: region, discord: discord || null };
+        const warband_url = await extractWarbandUrl(page);
+
+        const out = {
+          ...parsed,
+          regionUsed: region,
+          discord: discord || null,
+          warband_url: warband_url || null,
+        };
+
         setC(ck, out);
         return out;
       }
@@ -371,6 +409,7 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
   return null;
 }
 
+// --- lowest for run ---
 async function lowestFromRun(context, runUrl) {
   const rk = runKey(runUrl);
   const cached = getC(rk);
@@ -411,6 +450,7 @@ async function lowestFromRun(context, runUrl) {
     lowest: label,
     profile_url,
     discord: best.stat.discord || null,
+    warband_url: best.stat.warband_url || null,
     timed_total: best.stat.total,
     timed_breakdown: best.stat.by,
     partial,
@@ -421,11 +461,11 @@ async function lowestFromRun(context, runUrl) {
 }
 
 /* =======================
-   Очередь + воркер
+   Queue + worker
    ======================= */
 const runQueue = [];
 const queued = new Set();
-const inflight = new Map(); // url -> startedAt
+const inflight = new Map();
 let workerRunning = false;
 let lastProgressAt = now();
 
@@ -439,9 +479,7 @@ function enqueueRuns(urls, force = false) {
     if (cached && cached.ok && !cached.partial && !force) continue;
 
     const startedAt = inflight.get(u);
-    if (startedAt && t - startedAt > INFLIGHT_STALE_MS) {
-      inflight.delete(u);
-    }
+    if (startedAt && t - startedAt > INFLIGHT_STALE_MS) inflight.delete(u);
 
     if (queued.has(u) || inflight.has(u)) continue;
 
@@ -488,7 +526,6 @@ async function startWorker() {
           } else {
             setC(runKey(u), { ok: false, error: msg, partial: true }, 10 * 60 * 1000);
           }
-
           lastProgressAt = now();
         } finally {
           inflight.delete(u);
@@ -496,8 +533,7 @@ async function startWorker() {
       });
     }
   })()
-    .catch(async (e) => {
-      console.error("worker fatal:", e);
+    .catch(async () => {
       for (const [u] of inflight.entries()) {
         inflight.delete(u);
         if (!queued.has(u)) {
@@ -513,11 +549,9 @@ async function startWorker() {
     });
 }
 
-// watchdog: если воркер завис — перезапустим
 setInterval(() => {
   const t = now();
   if (workerRunning && t - lastProgressAt > INFLIGHT_STALE_MS) {
-    console.log("watchdog: no progress, restarting worker");
     for (const [u] of inflight.entries()) {
       inflight.delete(u);
       if (!queued.has(u)) {
@@ -531,7 +565,7 @@ setInterval(() => {
 }, 30_000);
 
 /* =======================
-   Batch FAST / FULL
+   Batch endpoints
    ======================= */
 function processBatchFast(urls) {
   const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
@@ -587,7 +621,7 @@ async function processBatchFull(urls) {
 }
 
 /* =======================
-   Endpoints
+   Routes
    ======================= */
 app.get("/health", (_, res) => res.json({ ok: true }));
 
