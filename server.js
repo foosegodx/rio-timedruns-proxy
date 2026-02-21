@@ -16,7 +16,7 @@ const UA =
   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 // ---- НАСТРОЙКИ ----
-const RUN_TIMEOUT_MS = 120_000;        // бюджет на 1 run (partial если не успели)
+const RUN_TIMEOUT_MS = 140_000;        // бюджет на 1 run (partial если не успели)
 const INFLIGHT_STALE_MS = 3 * 60_000; // inflight > 3 мин => считаем зависшим
 
 // скорость (достаточно быстро и обычно стабильно)
