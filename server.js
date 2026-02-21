@@ -19,7 +19,7 @@ const UA =
 const RUN_TIMEOUT_MS = 140_000;        // бюджет на 1 run (partial если не успели)
 const INFLIGHT_STALE_MS = 3 * 70_000; // inflight > 3 мин => считаем зависшим
 
-// скорость (достаточно быстро и обычно стабильно)
+// скорость
 const WORKER_BATCH = 6;
 const WORKER_PARALLEL = 2;
 
@@ -248,7 +248,31 @@ function parseTimedRunsAll(text) {
 }
 
 /**
- * ✅ Возвращает { total, by, regionUsed } или null
+ * Достаём Discord из "Contact Info".
+ * Обычно там два значения вида name#1234:
+ *  - BattleTag
+ *  - Discord
+ * Берём ВТОРОЕ, если оно есть.
+ */
+function parseDiscordFromText(text) {
+  const t = String(text || "").replace(/\u00a0/g, " ");
+  const idx = t.toLowerCase().indexOf("contact info");
+  const slice = idx !== -1 ? t.slice(idx, idx + 1200) : t;
+
+  const matches = [];
+  const re = /([\p{L}\p{N}_.-]{2,32}#\d{4})/gu;
+  let m;
+  while ((m = re.exec(slice)) !== null) {
+    matches.push(m[1]);
+  }
+
+  if (matches.length >= 2) return matches[1];
+  if (matches.length === 1) return matches[0];
+  return null;
+}
+
+/**
+ * ✅ Возвращает { total, by, regionUsed, discord } или null
  */
 async function fetchTimedTotal(context, realm, name, regionHint) {
   const ck = `tt:${(regionHint || "").toLowerCase()}:${realm}:${name}`.toLowerCase();
@@ -271,6 +295,7 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
 
+      // ждём, чтобы успели дорисоваться блоки
       try {
         await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 6000 });
       } catch (_) {}
@@ -279,7 +304,8 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
       const parsed = parseTimedRunsAll(bodyText);
 
       if (parsed) {
-        const out = { ...parsed, regionUsed: region };
+        const discord = parseDiscordFromText(bodyText);
+        const out = { ...parsed, regionUsed: region, discord: discord || null };
         setC(ck, out);
         return out;
       }
@@ -339,6 +365,7 @@ async function lowestFromRun(context, runUrl) {
     ok: true,
     lowest: label,
     profile_url,
+    discord: best.stat.discord || null,
     timed_total: best.stat.total,
     timed_breakdown: best.stat.by,
     partial,
@@ -409,7 +436,7 @@ async function startWorker() {
         } catch (e) {
           const msg = String(e?.message || e);
 
-          // ✅ если браузер/контекст закрыт — не кэшируем это как результат
+          // если браузер/контекст закрыт — не кэшируем это как результат
           if (isBrowserClosedError(msg)) {
             await ensureResetBrowser();
             context = await getContext();
@@ -479,7 +506,6 @@ function processBatchFast(urls) {
     const cached = getC(`run:${u}`);
 
     if (cached) {
-      // если в кэше лежит "browser closed" — удаляем и считаем как PENDING
       if (!cached.ok && isBrowserClosedError(cached.error)) {
         cache.delete(`run:${u}`);
         results[i] = { ok: false, error: "PENDING", partial: true };
