@@ -7,8 +7,8 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "1mb" }));
 
-// ✅ bump версии кэша (чтобы warband пересчитался)
-const CACHE_VER = "v9";
+// ✅ bump версии кэша (чтобы гарантированно пересчитать warband)
+const CACHE_VER = "v10";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -173,7 +173,7 @@ async function getContext() {
     const browser = await browserPromise;
     const context = await browser.newContext({ userAgent: UA });
 
-    // ✅ режем лишние ресурсы, но оставляем stylesheet (иногда влияет на появление табов)
+    // ✅ режем лишнее, но stylesheet оставляем
     await context.route("**/*", (route) => {
       const rt = route.request().resourceType();
       if (!["document", "script", "xhr", "fetch", "stylesheet"].includes(rt)) return route.abort();
@@ -348,15 +348,22 @@ async function findWarbandUrlFromPage(page) {
       if (a1) return abs(a1.getAttribute("href"));
 
       const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
-      const els = Array.from(document.querySelectorAll("a,button,[role='tab']"));
-      const hit = els.find((el) => norm(el.textContent).includes("warband"));
+      const els = Array.from(document.querySelectorAll("a,button,[role='tab'],[role='button'],[tabindex]"));
+      const hit = els.find((el) => {
+        const t = norm(el.textContent);
+        const al = norm(el.getAttribute?.("aria-label"));
+        const ti = norm(el.getAttribute?.("title"));
+        const href = norm(el.getAttribute?.("href"));
+        const dt = norm(el.getAttribute?.("data-testid"));
+        return [t, al, ti, href, dt].some((x) => x && x.includes("warband"));
+      });
       if (!hit) return null;
 
-      const a = hit.closest("a");
+      const a = hit.closest?.("a");
       const raw =
         (a && a.getAttribute("href")) ||
-        hit.getAttribute("href") ||
-        hit.getAttribute("to") ||
+        hit.getAttribute?.("href") ||
+        hit.getAttribute?.("to") ||
         (hit.dataset && (hit.dataset.href || hit.dataset.to || hit.dataset.url)) ||
         null;
 
@@ -426,16 +433,38 @@ async function findWarbandUrlFromPage(page) {
   return fromScripts || null;
 }
 
-async function waitForWarbandTab(page, timeoutMs = 12000) {
-  const loc = page
-    .locator('a:has-text("Warband"), button:has-text("Warband"), [role="tab"]:has-text("Warband")')
-    .first();
-  try {
-    await loc.waitFor({ state: "attached", timeout: timeoutMs });
-    return loc;
-  } catch {
-    return null;
+async function detectHasWarband(page) {
+  // Ищем "warband" НЕ только в тексте, но и в aria/title/href/data-*
+  return await page
+    .evaluate(() => {
+      const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const els = Array.from(
+        document.querySelectorAll("a,button,[role='tab'],[role='button'],[tabindex],[aria-label],[title]")
+      );
+
+      return els.some((el) => {
+        const t = norm(el.textContent);
+        const al = norm(el.getAttribute?.("aria-label"));
+        const ti = norm(el.getAttribute?.("title"));
+        const href = norm(el.getAttribute?.("href"));
+        const to = norm(el.getAttribute?.("to"));
+        const dt = norm(el.getAttribute?.("data-testid"));
+        const du = norm(el.getAttribute?.("data-url"));
+        const dh = norm(el.getAttribute?.("data-href"));
+        return [t, al, ti, href, to, dt, du, dh].some((x) => x && x.includes("warband"));
+      });
+    })
+    .catch(() => false);
+}
+
+async function waitForWarbandEvidence(page, totalMs = 12_000, stepMs = 400) {
+  const end = Date.now() + totalMs;
+  while (Date.now() < end) {
+    const ok = await detectHasWarband(page);
+    if (ok) return true;
+    await page.waitForTimeout(stepMs);
   }
+  return false;
 }
 
 async function fetchWarbandUrl(context, region, realm, name) {
@@ -453,10 +482,11 @@ async function fetchWarbandUrl(context, region, realm, name) {
 
   try {
     await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(800); // дать JS “подышать”
 
-    // ✅ Ждём вкладку Warband (она часто появляется с задержкой)
-    const tab = await waitForWarbandTab(page, 12000);
-    if (!tab) {
+    // ✅ ждём появления warband в интерфейсе
+    const hasWar = await waitForWarbandEvidence(page, 12_000, 400);
+    if (!hasWar) {
       setC(ck, null);
       return null;
     }
@@ -468,9 +498,15 @@ async function fetchWarbandUrl(context, region, realm, name) {
       return url;
     }
 
-    // 2) кликаем Warband и пробуем снова
-    await tab.click({ timeout: 6000 }).catch(() => {});
-    await page.waitForTimeout(800);
+    // 2) кликаем найденный элемент warband (если есть) и пробуем снова
+    await page
+      .locator(
+        'a:has-text("Warband"), button:has-text("Warband"), [role="tab"]:has-text("Warband"), [aria-label*="warband" i], [title*="warband" i]'
+      )
+      .first()
+      .click({ timeout: 6000 })
+      .catch(() => {});
+    await page.waitForTimeout(900);
 
     url = await findWarbandUrlFromPage(page);
     if (url) {
@@ -767,11 +803,12 @@ async function processBatchFull(urls) {
 /* =======================
    Routes
    ======================= */
-app.get("/health", (_, res) => res.json({ ok: true }));
+app.get("/health", (_, res) => res.json({ ok: true, ver: CACHE_VER }));
 
 app.get("/debug", (_, res) => {
   res.json({
     ok: true,
+    ver: CACHE_VER,
     cacheSize: cache.size,
     queueLen: runQueue.length,
     queued: queued.size,
