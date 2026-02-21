@@ -3,6 +3,7 @@ import fetch from "node-fetch";
 import { chromium } from "playwright";
 
 const app = express();
+app.use(express.json({ limit: "1mb" })); // <-- нужно для batch (POST JSON)
 const PORT = process.env.PORT || 3000;
 
 const cache = new Map();
@@ -79,19 +80,15 @@ async function fetchRunRoster(runUrl) {
   return roster;
 }
 
-// ✅ более “живучий” парсер timed 5+
 function parseTimed5(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
 
-  // 1) как на скрине
   let m = t.match(/(\d[\d,]*)\s+5\+\s+Keystone\s+Timed\s+Runs/i);
   if (m) return Number(String(m[1]).replace(/,/g, ""));
 
-  // 2) иногда без слова Keystone
   m = t.match(/(\d[\d,]*)\s+5\+\s+Timed\s+Runs/i);
   if (m) return Number(String(m[1]).replace(/,/g, ""));
 
-  // 3) если переносы/разный порядок — ищем около "Timed Runs"
   const idx = t.toLowerCase().indexOf("timed runs");
   if (idx !== -1) {
     const slice = t.slice(Math.max(0, idx - 300), idx + 300);
@@ -99,7 +96,6 @@ function parseTimed5(text) {
     if (m) return Number(String(m[1]).replace(/,/g, ""));
   }
 
-  // 4) fallback: ищем просто "5+ ... Runs" (на случай, если слово Timed пропущено)
   m = t.match(/(\d[\d,]*)\s+5\+\s+.*?\s+Runs/i);
   if (m) return Number(String(m[1]).replace(/,/g, ""));
 
@@ -109,7 +105,7 @@ function parseTimed5(text) {
 async function fetchTimed5(browser, realm, name) {
   const ck = `t5:${realm}:${name}`;
   const cached = getC(ck);
-  if (cached !== null) return cached; // может быть числом или null
+  if (cached !== null) return cached;
 
   for (const region of regions) {
     const page = await browser.newPage({
@@ -118,7 +114,6 @@ async function fetchTimed5(browser, realm, name) {
         "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     });
 
-    // ускорение + меньше шансов на проблемы
     await page.route("**/*", (route) => {
       const rt = route.request().resourceType();
       if (["image", "font", "media"].includes(rt)) return route.abort();
@@ -130,12 +125,9 @@ async function fetchTimed5(browser, realm, name) {
     try {
       await page.goto(url, { waitUntil: "networkidle", timeout: 45000 });
 
-      // ждём появления блока Timed Runs (если есть)
       try {
         await page.waitForSelector('text=/Timed Runs/i', { timeout: 8000 });
-      } catch (_) {
-        // всё равно попробуем спарсить
-      }
+      } catch (_) {}
 
       await page.waitForTimeout(500);
 
@@ -146,7 +138,6 @@ async function fetchTimed5(browser, realm, name) {
         return v;
       }
     } catch (_) {
-      // ignore and try next region
     } finally {
       await page.close();
     }
@@ -156,18 +147,67 @@ async function fetchTimed5(browser, realm, name) {
   return null;
 }
 
+async function lowestFromRunUrl(browser, runUrl) {
+  const runCacheKey = `run:${runUrl}`;
+  const cached = getC(runCacheKey);
+  if (cached) return cached;
+
+  const roster = await fetchRunRoster(runUrl);
+
+  let best = null;
+  for (const p of roster) {
+    const t5 = await fetchTimed5(browser, p.realm, p.name);
+    if (t5 === null) continue;
+    if (!best || t5 < best.t5) best = { name: p.name, realm: p.realm, t5: t5 };
+  }
+
+  const out = best
+    ? { ok: true, lowest: `${best.name}-${best.realm}`.toLowerCase(), timed5: best.t5 }
+    : { ok: false, error: "no timed5 found" };
+
+  setC(runCacheKey, out);
+  return out;
+}
+
 app.get("/health", (_, res) => res.json({ ok: true }));
 
+// Старый (одиночный) endpoint оставляем
 app.get("/lowest-from-run", async (req, res) => {
   const runUrl = req.query.url;
   if (!runUrl) return res.status(400).json({ ok: false, error: "missing url" });
 
-  const cacheKey = `run:${runUrl}`;
-  const cached = getC(cacheKey);
-  if (cached) return res.json(cached);
-
   try {
-    const roster = await fetchRunRoster(runUrl);
+    const browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+    });
+
+    try {
+      const out = await lowestFromRunUrl(browser, String(runUrl).trim());
+      res.json(out);
+    } finally {
+      await browser.close();
+    }
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+/**
+ * ✅ Новый batch endpoint:
+ * POST /lowest-from-runs
+ * Body: { "urls": ["https://...", "..."] }
+ * Returns: { ok:true, results:[ {ok:true,lowest:...} or {ok:false,error:...}, ... ] }
+ */
+app.post("/lowest-from-runs", async (req, res) => {
+  try {
+    const urls = req.body && req.body.urls;
+    if (!urls || !Array.isArray(urls)) {
+      return res.status(400).json({ ok: false, error: "Body must be { urls: [...] }" });
+    }
+
+    // фильтруем пустые и ограничим размер запроса
+    const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
 
     const browser = await chromium.launch({
       headless: true,
@@ -175,53 +215,27 @@ app.get("/lowest-from-run", async (req, res) => {
     });
 
     try {
-      let best = null;
-
-      for (const p of roster) {
-        const t5 = await fetchTimed5(browser, p.realm, p.name);
-        if (t5 === null) continue;
-
-        if (!best || t5 < best.t5) best = { name: p.name, realm: p.realm, t5 };
+      const results = [];
+      for (let i = 0; i < clean.length; i++) {
+        const u = clean[i];
+        if (!u) {
+          results.push({ ok: false, error: "empty url" });
+          continue;
+        }
+        try {
+          const out = await lowestFromRunUrl(browser, u);
+          results.push(out);
+        } catch (e) {
+          results.push({ ok: false, error: String(e.message || e) });
+        }
       }
 
-      const out = best
-        ? { ok: true, lowest: `${best.name}-${best.realm}`.toLowerCase(), timed5: best.t5 }
-        : { ok: false, error: "no timed5 found" };
-
-      setC(cacheKey, out);
-      return res.json(out);
+      return res.json({ ok: true, results: results });
     } finally {
       await browser.close();
     }
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// ✅ debug endpoint: показывает кусок текста вокруг "Timed Runs" для конкретного чара
-app.get("/debug-char", async (req, res) => {
-  const region = req.query.region || "eu";
-  const realm = req.query.realm;
-  const name = req.query.name;
-  if (!realm || !name) return res.status(400).json({ ok: false, error: "need realm & name" });
-
-  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
-  try {
-    const page = await browser.newPage();
-    const url = `https://raider.io/characters/${region}/${encodeURIComponent(realm)}/${encodeURIComponent(name)}`;
-    await page.goto(url, { waitUntil: "networkidle", timeout: 45000 });
-
-    const text = await page.evaluate(() => document.body?.innerText || "");
-    const low = text.toLowerCase();
-    const idx = low.indexOf("timed runs");
-    const snippet =
-      idx === -1
-        ? text.slice(0, 2000)
-        : text.slice(Math.max(0, idx - 500), idx + 500);
-
-    res.json({ ok: true, url, hasTimedRuns: idx !== -1, timed5Parsed: parseTimed5(text), snippet });
-  } finally {
-    await browser.close();
   }
 });
 
