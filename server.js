@@ -7,8 +7,8 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "1mb" }));
 
-// ✅ bump версии кэша (чтобы сразу пересчитать warband/discord)
-const CACHE_VER = "v3";
+// ✅ bump версии кэша (чтобы сразу пересчитать warband)
+const CACHE_VER = "v4";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -31,9 +31,14 @@ const PARTIAL_RETRY_MAX = 2;
 const PARTIAL_RETRY_DELAY_MS = 30_000;
 const partialAttempts = new Map(); // runUrl -> attempts
 
+// отдельный лимит на попытку добыть warband ссылку (чтобы не зависать)
+const WAR_BAND_TIMEOUT_MS = 12_000;
+
 const runKey = (u) => `run:${CACHE_VER}:${u}`;
 const ttKey = (regionHint, realm, name) =>
   `tt:${CACHE_VER}:${(regionHint || "").toLowerCase()}:${String(realm)}:${String(name)}`.toLowerCase();
+const wbKey = (region, realm, name) =>
+  `wb:${CACHE_VER}:${region}:${String(realm)}:${String(name)}`.toLowerCase();
 
 function now() {
   return Date.now();
@@ -110,6 +115,22 @@ function isBrowserClosedError(msg) {
   );
 }
 
+function withTimeout(promiseFactory, ms, label = "timeout") {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(label)), ms);
+    Promise.resolve()
+      .then(promiseFactory)
+      .then((v) => {
+        clearTimeout(t);
+        resolve(v);
+      })
+      .catch((e) => {
+        clearTimeout(t);
+        reject(e);
+      });
+  });
+}
+
 // --- Playwright singleton ---
 let browserPromise = null;
 let contextPromise = null;
@@ -152,6 +173,7 @@ async function getContext() {
     const browser = await browserPromise;
     const context = await browser.newContext({ userAgent: UA });
 
+    // режем лишние ресурсы
     await context.route("**/*", (route) => {
       const rt = route.request().resourceType();
       if (!["document", "script", "xhr", "fetch"].includes(rt)) return route.abort();
@@ -299,7 +321,6 @@ function parseDiscordFromText(text) {
     return null;
   }
 
-  // нет BattleTag -> берём только новый Discord (без #)
   for (const cand of lines) {
     if (/^https?:\/\//i.test(cand)) continue;
     if (isStopWord(cand)) continue;
@@ -309,48 +330,8 @@ function parseDiscordFromText(text) {
   return null;
 }
 
-// --- Warband link extraction (DOM) ---
-async function extractWarbandUrl(page) {
-  try {
-    const href = await page.evaluate(() => {
-      const norm = (s) => (s || "").trim().toLowerCase();
-
-      // чаще всего это <a> в табах
-      const a = Array.from(document.querySelectorAll("a")).find(
-        (el) => norm(el.textContent) === "warband"
-      );
-      if (a && a.href) return a.href;
-
-      // иногда это роль tab/button
-      const el = Array.from(document.querySelectorAll('a,[role="tab"],button')).find(
-        (x) => norm(x.textContent) === "warband"
-      );
-      if (!el) return null;
-
-      const raw =
-        el.getAttribute("href") ||
-        (el.dataset && (el.dataset.href || el.dataset.url)) ||
-        null;
-
-      if (!raw) return null;
-
-      if (/^https?:\/\//i.test(raw)) return raw;
-      return new URL(raw, location.origin).toString();
-    });
-
-    if (!href) return null;
-
-    // нормализуем на всякий случай
-    if (/^https?:\/\/raider\.io\//i.test(href)) return href;
-    if (href.startsWith("/")) return `https://raider.io${href}`;
-    return href;
-  } catch {
-    return null;
-  }
-}
-
 /**
- * ✅ Возвращает { total, by, regionUsed, discord, warband_url } или null
+ * ✅ Возвращает { total, by, regionUsed, discord } или null
  */
 async function fetchTimedTotal(context, realm, name, regionHint) {
   const ck = ttKey(regionHint, realm, name);
@@ -373,7 +354,6 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
 
-      // ждём чтобы табы/контент успели появиться
       try {
         await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 6000 });
       } catch (_) {}
@@ -386,15 +366,7 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
 
       if (parsed) {
         const discord = parseDiscordFromText(bodyText);
-        const warband_url = await extractWarbandUrl(page);
-
-        const out = {
-          ...parsed,
-          regionUsed: region,
-          discord: discord || null,
-          warband_url: warband_url || null,
-        };
-
+        const out = { ...parsed, regionUsed: region, discord: discord || null };
         setC(ck, out);
         return out;
       }
@@ -407,6 +379,88 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
 
   setC(ck, null);
   return null;
+}
+
+/**
+ * ✅ Получение warband URL:
+ * 1) Если на странице есть вкладка Warband и у неё есть href -> возвращаем href
+ * 2) Иначе кликаем по вкладке Warband и берём page.url()
+ * Если вкладки нет — null
+ */
+async function fetchWarbandUrl(context, region, realm, name) {
+  const ck = wbKey(region, realm, name);
+  const cached = getC(ck);
+  if (cached !== null) return cached; // string | null
+
+  const profileUrl = `https://raider.io/characters/${region}/${encodeURIComponent(realm)}/${encodeURIComponent(
+    name
+  )}`;
+
+  const page = await context.newPage();
+  page.setDefaultTimeout(15000);
+  page.setDefaultNavigationTimeout(15000);
+
+  try {
+    await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+
+    // ждём появления табов
+    try {
+      await page.waitForSelector('text=/Warband/i', { timeout: 6000 });
+    } catch {
+      setC(ck, null);
+      return null;
+    }
+
+    // 1) пробуем получить href без клика
+    const href = await page.evaluate(() => {
+      const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const els = Array.from(document.querySelectorAll("a,[role='tab'],button"));
+      const hit = els.find((el) => norm(el.textContent).includes("warband"));
+      if (!hit) return null;
+
+      const a = hit.closest("a");
+      const raw = (a && a.getAttribute("href")) || hit.getAttribute("href") || null;
+      if (!raw) return null;
+
+      if (/^https?:\/\//i.test(raw)) return raw;
+      return new URL(raw, location.origin).toString();
+    });
+
+    if (href) {
+      setC(ck, href);
+      return href;
+    }
+
+    // 2) кликаем и ждём изменения URL
+    const before = page.url();
+
+    const tab = page.locator('a:has-text("Warband"), [role="tab"]:has-text("Warband"), button:has-text("Warband")').first();
+    await tab.click({ timeout: 5000 });
+
+    // ждём, что URL изменится или начнёт содержать "warband"
+    try {
+      await page.waitForFunction(
+        (u) => location.href !== u || /warband/i.test(location.href),
+        before,
+        { timeout: 8000 }
+      );
+    } catch (_) {}
+
+    const after = page.url();
+    if (after && after !== before) {
+      setC(ck, after);
+      return after;
+    }
+
+    // бывает SPA без изменения URL — тогда warband URL неоткуда взять
+    setC(ck, null);
+    return null;
+  } catch {
+    setC(ck, null);
+    return null;
+  } finally {
+    await page.close();
+  }
 }
 
 // --- lowest for run ---
@@ -445,12 +499,24 @@ async function lowestFromRun(context, runUrl) {
     best.p.realm
   )}/${encodeURIComponent(best.p.name)}`;
 
+  // ✅ warband только для выбранного "lowest" (чтобы не тормозить на всех)
+  let warband_url = null;
+  try {
+    warband_url = await withTimeout(
+      () => fetchWarbandUrl(context, regionForUrl, best.p.realm, best.p.name),
+      WAR_BAND_TIMEOUT_MS,
+      "warband_timeout"
+    );
+  } catch {
+    warband_url = null;
+  }
+
   const out = {
     ok: true,
     lowest: label,
     profile_url,
     discord: best.stat.discord || null,
-    warband_url: best.stat.warband_url || null,
+    warband_url: warband_url || null,
     timed_total: best.stat.total,
     timed_breakdown: best.stat.by,
     partial,
