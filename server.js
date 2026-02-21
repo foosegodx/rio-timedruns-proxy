@@ -5,7 +5,6 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// нужно для POST JSON
 app.use(express.json({ limit: "1mb" }));
 
 const cache = new Map();
@@ -59,14 +58,6 @@ function normalizeRegion(regionRaw) {
   return "";
 }
 
-// base64 websafe (Apps Script) -> utf8
-function decodeBase64WebSafeToUtf8(enc) {
-  const s = String(enc || "");
-  let b64 = s.replace(/-/g, "+").replace(/_/g, "/");
-  while (b64.length % 4) b64 += "=";
-  return Buffer.from(b64, "base64").toString("utf8");
-}
-
 // устойчивый парсер 5+ Timed Runs
 function parseTimed5(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
@@ -75,7 +66,7 @@ function parseTimed5(text) {
   let m = t.match(/(\d[\d,]*)\s+5\+\s+Keystone\s+Timed\s+Runs/i);
   if (m) return Number(String(m[1]).replace(/,/g, ""));
 
-  // число справа (иногда бывает так)
+  // число справа
   m = t.match(/5\+\s+Keystone\s+Timed\s+Runs\s+(\d[\d,]*)/i);
   if (m) return Number(String(m[1]).replace(/,/g, ""));
 
@@ -92,13 +83,10 @@ function parseTimed5(text) {
     if (m) return Number(String(m[1]).replace(/,/g, ""));
   }
 
-  m = t.match(/(\d[\d,]*)\s+5\+\s+.*?\s+Runs/i);
-  if (m) return Number(String(m[1]).replace(/,/g, ""));
-
   return null;
 }
 
-// --- простой лимитер параллелизма без зависимостей ---
+// --- лимитер параллелизма ---
 async function mapLimit(items, limit, fn) {
   const arr = Array.from(items);
   const out = new Array(arr.length);
@@ -116,7 +104,7 @@ async function mapLimit(items, limit, fn) {
   return out;
 }
 
-// --- Playwright singleton (browser + context) ---
+// --- Playwright singleton ---
 let browserPromise = null;
 let contextPromise = null;
 
@@ -134,7 +122,6 @@ async function getContext() {
     const browser = await browserPromise;
     const context = await browser.newContext({ userAgent: UA });
 
-    // режем всё лишнее
     await context.route("**/*", (route) => {
       const rt = route.request().resourceType();
       if (!["document", "script", "xhr", "fetch"].includes(rt)) return route.abort();
@@ -159,7 +146,7 @@ async function shutdown() {
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
-// --- Raider.IO run-details roster ---
+// --- run-details roster ---
 async function fetchRunRoster(runUrl) {
   const m = String(runUrl).match(/\/mythic-plus-runs\/(season-[^/]+)\/(\d+)-/i);
   if (!m) throw new Error("Bad URL");
@@ -206,15 +193,11 @@ async function fetchRunRoster(runUrl) {
   return roster;
 }
 
-function charKey(c) {
-  return `${(c.region || "").toLowerCase()}:${c.realm.toLowerCase()}:${c.name.toLowerCase()}`;
-}
-
-// --- Получение timed5 по персонажу ---
+// --- timed5 по персонажу ---
 async function fetchTimed5(context, realm, name, regionHint) {
   const ck = `t5:${(regionHint || "").toLowerCase()}:${realm}:${name}`.toLowerCase();
   const cached = getC(ck);
-  if (cached !== null) return cached; // число или null
+  if (cached !== null) return cached;
 
   const tryRegions = [];
   if (regionHint && regions.includes(regionHint)) tryRegions.push(regionHint);
@@ -232,7 +215,6 @@ async function fetchTimed5(context, realm, name, regionHint) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
 
-      // пробуем быстро найти точечный текст
       let txt = null;
       try {
         const loc = page.locator("text=/5\\+\\s+Keystone\\s+Timed\\s+Runs/i").first();
@@ -242,7 +224,6 @@ async function fetchTimed5(context, realm, name, regionHint) {
 
       let v = txt ? parseTimed5(txt) : null;
 
-      // fallback: весь текст страницы
       if (v === null) {
         const bodyText = await page.evaluate(() => document.body?.innerText || "");
         v = parseTimed5(bodyText);
@@ -263,34 +244,28 @@ async function fetchTimed5(context, realm, name, regionHint) {
   return null;
 }
 
-// ✅ Lowest для одного run: теперь null считаем как 0 (поэтому "no timed5 found" не будет)
-async function lowestFromRun(context, runUrl, precomputedT5Map = null) {
+// ✅ Lowest для одного run (null считаем как 0)
+async function lowestFromRun(context, runUrl) {
   const runCacheKey = `run:${runUrl}`;
   const cached = getC(runCacheKey);
   if (cached) return cached;
 
   const roster = await fetchRunRoster(runUrl);
 
+  // параллелим timed5 внутри 1 run, но аккуратно (чтобы не убить память)
+  const t5List = await mapLimit(roster, 3, async (p) => {
+    const v = await fetchTimed5(context, p.realm, p.name, p.region);
+    return { p, t5: v === null ? 0 : v };
+  });
+
   let best = null;
-
-  for (const p of roster) {
-    const k = charKey(p);
-
-    const t5raw =
-      precomputedT5Map && precomputedT5Map.has(k)
-        ? precomputedT5Map.get(k)
-        : await fetchTimed5(context, p.realm, p.name, p.region);
-
-    const t5 = (t5raw === null) ? 0 : t5raw; // ✅ ключевое изменение
-
-    if (!best || t5 < best.t5) {
-      best = { name: p.name, realm: p.realm, t5 };
-    }
+  for (const it of t5List) {
+    if (!best || it.t5 < best.t5) best = it;
   }
 
   const out = {
     ok: true,
-    lowest: `${best.name}-${best.realm}`.toLowerCase(),
+    lowest: `${best.p.name}-${best.p.realm}`.toLowerCase(),
     timed5: best.t5,
   };
 
@@ -298,88 +273,64 @@ async function lowestFromRun(context, runUrl, precomputedT5Map = null) {
   return out;
 }
 
-// --- Полный batch (может быть долгим) ---
-async function processBatchFull(urls) {
-  const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
-  const context = await getContext();
+/* =========================================================
+   ✅ Очередь прогрева (чтобы 100 ссылок не стояли PENDING вечность)
+   ========================================================= */
+const runQueue = [];
+const queued = new Set();
+const inflight = new Set();
+let workerRunning = false;
 
-  const results = new Array(clean.length).fill(null);
-  const todo = [];
-
-  for (let i = 0; i < clean.length; i++) {
-    const u = clean[i];
-    if (!u) {
-      results[i] = { ok: false, error: "empty url" };
-      continue;
-    }
-    const cached = getC(`run:${u}`);
-    if (cached) results[i] = cached;
-    else todo.push({ i, u });
+function enqueueRuns(urls) {
+  for (const u0 of urls) {
+    const u = String(u0 || "").trim();
+    if (!u) continue;
+    if (getC(`run:${u}`)) continue;        // уже готово
+    if (queued.has(u) || inflight.has(u)) continue;
+    queued.add(u);
+    runQueue.push(u);
   }
-
-  if (!todo.length) return results;
-
-  const rosterPacked = await mapLimit(todo, 10, async ({ i, u }) => {
-    try {
-      const roster = await fetchRunRoster(u);
-      return { i, u, ok: true, roster };
-    } catch (e) {
-      return { i, u, ok: false, error: String(e.message || e) };
-    }
-  });
-
-  const uniqueChars = new Map();
-  for (const r of rosterPacked) {
-    if (!r.ok) continue;
-    for (const c of r.roster) uniqueChars.set(charKey(c), c);
-  }
-
-  const t5Map = new Map();
-  await mapLimit(uniqueChars.values(), 4, async (c) => {
-    const v = await fetchTimed5(context, c.realm, c.name, c.region);
-    t5Map.set(charKey(c), v);
-  });
-
-  for (const r of rosterPacked) {
-    if (!r.ok) {
-      results[r.i] = { ok: false, error: r.error };
-      continue;
-    }
-    try {
-      const out = await lowestFromRun(context, r.u, t5Map);
-      results[r.i] = out;
-    } catch (e) {
-      results[r.i] = { ok: false, error: String(e.message || e) };
-    }
-  }
-
-  return results;
+  startWorker();
 }
 
-// --- Быстрый batch: отдаём cache/PENDING и греем фон ---
-const inflightWarm = new Set();
-
-function warmInBackground(missingUrls) {
-  const uniq = [];
-  for (const u of missingUrls) {
-    if (!u) continue;
-    if (inflightWarm.has(u)) continue;
-    inflightWarm.add(u);
-    uniq.push(u);
-  }
-  if (!uniq.length) return;
+async function startWorker() {
+  if (workerRunning) return;
+  workerRunning = true;
 
   (async () => {
-    try {
-      await processBatchFull(uniq);
-    } catch (e) {
-      console.error("warm error:", e);
-    } finally {
-      for (const u of uniq) inflightWarm.delete(u);
+    const context = await getContext();
+
+    while (runQueue.length) {
+      // берем небольшими пачками
+      const batch = runQueue.splice(0, 6);
+      for (const u of batch) {
+        queued.delete(u);
+        inflight.add(u);
+      }
+
+      // считаем ограниченной параллельностью
+      await mapLimit(batch, 2, async (u) => {
+        try {
+          await lowestFromRun(context, u);
+        } catch (e) {
+          setC(`run:${u}`, { ok: false, error: String(e.message || e) });
+        } finally {
+          inflight.delete(u);
+        }
+      });
     }
-  })();
+  })()
+    .catch((e) => console.error("worker fatal:", e))
+    .finally(() => {
+      workerRunning = false;
+      // если пока работали добавили ещё — запустимся снова
+      if (runQueue.length) startWorker();
+    });
 }
 
+/* =========================================================
+   Batch FAST / FULL
+   ========================================================= */
 function processBatchFast(urls) {
   const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
 
@@ -400,14 +351,47 @@ function processBatchFast(urls) {
     }
   }
 
-  if (missing.length) warmInBackground(missing);
+  // ✅ добавляем в очередь и сразу отдаём ответ
+  if (missing.length) enqueueRuns(missing);
 
   return results;
 }
 
+async function processBatchFull(urls) {
+  const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
+  const context = await getContext();
+
+  // считаем всё до конца (для ручной отладки, не для Sheets)
+  const out = await mapLimit(clean, 2, async (u) => {
+    if (!u) return { ok: false, error: "empty url" };
+    try {
+      return await lowestFromRun(context, u);
+    } catch (e) {
+      return { ok: false, error: String(e.message || e) };
+    }
+  });
+
+  return out;
+}
+
+/* =========================================================
+   Endpoints
+   ========================================================= */
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// одиночный GET (для ручной проверки)
+// ✅ смотреть прогресс
+app.get("/debug", (_, res) => {
+  res.json({
+    ok: true,
+    cacheSize: cache.size,
+    queueLen: runQueue.length,
+    queued: queued.size,
+    inflight: inflight.size,
+    workerRunning,
+  });
+});
+
+// одиночный GET (для проверки)
 app.get("/lowest-from-run", async (req, res) => {
   const runUrl = req.query.url;
   if (!runUrl) return res.status(400).json({ ok: false, error: "missing url" });
@@ -421,7 +405,7 @@ app.get("/lowest-from-run", async (req, res) => {
   }
 });
 
-// batch GET (старый)
+// batch GET (legacy)
 app.get("/lowest-from-runs-get", async (req, res) => {
   try {
     const enc = req.query.urls;
@@ -446,7 +430,7 @@ app.get("/lowest-from-runs-get", async (req, res) => {
   }
 });
 
-// batch POST: по умолчанию FAST, но можно ?full=1
+// ✅ batch POST: по умолчанию FAST, можно ?full=1
 app.post("/lowest-from-runs", async (req, res) => {
   try {
     const full = String(req.query.full || "") === "1";
