@@ -7,6 +7,9 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "1mb" }));
 
+// ✅ bump версии кэша, чтобы заново перепарсить Discord
+const CACHE_VER = "v2";
+
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
 const regions = ["eu", "us", "kr", "tw", "cn"];
@@ -27,6 +30,10 @@ const WORKER_PARALLEL = 2;
 const PARTIAL_RETRY_MAX = 2;
 const PARTIAL_RETRY_DELAY_MS = 30_000;
 const partialAttempts = new Map(); // runUrl -> attempts
+
+const runKey = (u) => `run:${CACHE_VER}:${u}`;
+const ttKey = (regionHint, realm, name) =>
+  `tt:${CACHE_VER}:${(regionHint || "").toLowerCase()}:${String(realm)}:${String(name)}`.toLowerCase();
 
 function now() {
   return Date.now();
@@ -248,18 +255,17 @@ function parseTimedRunsAll(text) {
 }
 
 /**
- * ✅ Discord берём строго из Contact Info:
- *  - находим BattleTag (строка с #1234)
- *  - Discord = следующая строка (может быть без #, как "deaqaze")
+ * ✅ Discord из Contact Info:
+ * - если есть BattleTag (#1234) -> Discord = следующая строка (может быть без #)
+ * - если BattleTag НЕТ -> берём первую строку, похожую на discord username (без #)
  */
 function parseDiscordFromText(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const idx = t.toLowerCase().indexOf("contact info");
   if (idx === -1) return null;
 
-  let slice = t.slice(idx, idx + 1800);
+  let slice = t.slice(idx, idx + 2000);
 
-  // обрезаем по началу следующего большого блока (чтобы не ловить лишнее)
   const cut = slice.search(/\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs)\b/i);
   if (cut > 0) slice = slice.slice(0, cut);
 
@@ -268,21 +274,30 @@ function parseDiscordFromText(text) {
     .map((s) => s.trim())
     .filter((s) => s && s.toLowerCase() !== "contact info");
 
-  // BattleTag обычно имеет #1234
-  const btIdx = lines.findIndex((l) => /#\d{4}\b/.test(l));
-  if (btIdx === -1) return null;
+  // удобные регэкспы
+  const btRe = /#\d{4}\b/;
+  const discordNewRe = /^[\p{L}\p{N}_.-]{2,32}$/u;          // deaqaze / kaasklomp
+  const discordOldRe = /^[\p{L}\p{N}_.-]{2,32}#\d{4}$/u;    // old discord
 
-  // Discord обычно следующая строка после BattleTag
-  for (let i = btIdx + 1; i < lines.length; i++) {
-    const cand = lines[i];
+  const btIdx = lines.findIndex((l) => btRe.test(l));
 
-    // пропускаем URL / явные мусорные строки
-    if (/^https?:\/\//i.test(cand)) continue;
-    if (cand.length < 2 || cand.length > 40) continue;
-
-    return cand;
+  if (btIdx !== -1) {
+    // Discord обычно следующая строка
+    for (let i = btIdx + 1; i < lines.length; i++) {
+      const cand = lines[i];
+      if (/^https?:\/\//i.test(cand)) continue;
+      if (discordNewRe.test(cand) || discordOldRe.test(cand)) return cand;
+    }
+    return null;
   }
 
+  // ✅ нет BattleTag: ищем discord-ник без #
+  for (const cand of lines) {
+    if (/^https?:\/\//i.test(cand)) continue;
+    if (discordNewRe.test(cand)) return cand; // без # — точно не battletag
+  }
+
+  // (если остался только один "name#1234" — не берём, чтобы не спутать с BattleTag)
   return null;
 }
 
@@ -290,7 +305,7 @@ function parseDiscordFromText(text) {
  * ✅ Возвращает { total, by, regionUsed, discord } или null
  */
 async function fetchTimedTotal(context, realm, name, regionHint) {
-  const ck = `tt:${(regionHint || "").toLowerCase()}:${realm}:${name}`.toLowerCase();
+  const ck = ttKey(regionHint, realm, name);
   const cached = getC(ck);
   if (cached !== null) return cached; // объект или null
 
@@ -314,6 +329,10 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
       try {
         await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 6000 });
       } catch (_) {}
+      // ✅ дополнительно ждём Contact Info (если он лениво догружается)
+      try {
+        await page.waitForSelector('text=/Contact\\s+Info/i', { timeout: 4000 });
+      } catch (_) {}
 
       const bodyText = await page.evaluate(() => document.body?.innerText || "");
       const parsed = parseTimedRunsAll(bodyText);
@@ -335,15 +354,9 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
   return null;
 }
 
-/**
- * partial вместо run_timeout:
- * - есть дедлайн
- * - успели часть -> partial:true
- * - успели всех -> partial:false
- */
 async function lowestFromRun(context, runUrl) {
-  const runCacheKey = `run:${runUrl}`;
-  const cached = getC(runCacheKey);
+  const rk = runKey(runUrl);
+  const cached = getC(rk);
   if (cached) return cached;
 
   const roster = await fetchRunRoster(runUrl);
@@ -366,7 +379,7 @@ async function lowestFromRun(context, runUrl) {
 
   if (!best) {
     const outFail = { ok: false, error: "no timed totals found", partial: true };
-    setC(runCacheKey, outFail, 10 * 60 * 1000);
+    setC(rk, outFail, 10 * 60 * 1000);
     return outFail;
   }
 
@@ -386,7 +399,7 @@ async function lowestFromRun(context, runUrl) {
     partial,
   };
 
-  setC(runCacheKey, out, partial ? 20 * 60 * 1000 : TTL_MS);
+  setC(rk, out, partial ? 20 * 60 * 1000 : TTL_MS);
   return out;
 }
 
@@ -405,7 +418,7 @@ function enqueueRuns(urls, force = false) {
     const u = String(u0 || "").trim();
     if (!u) continue;
 
-    const cached = getC(`run:${u}`);
+    const cached = getC(runKey(u));
     if (cached && cached.ok && !cached.partial && !force) continue;
 
     const startedAt = inflight.get(u);
@@ -438,7 +451,7 @@ async function startWorker() {
       await mapLimit(batch, WORKER_PARALLEL, async (u) => {
         try {
           const out = await lowestFromRun(context, u);
-          setC(`run:${u}`, out, out.partial ? 20 * 60 * 1000 : TTL_MS);
+          setC(runKey(u), out, out.partial ? 20 * 60 * 1000 : TTL_MS);
           lastProgressAt = now();
 
           if (out.ok && out.partial) {
@@ -451,13 +464,12 @@ async function startWorker() {
         } catch (e) {
           const msg = String(e?.message || e);
 
-          // если браузер/контекст закрыт — не кэшируем это как результат
           if (isBrowserClosedError(msg)) {
             await ensureResetBrowser();
             context = await getContext();
             setTimeout(() => enqueueRuns([u], true), 2000);
           } else {
-            setC(`run:${u}`, { ok: false, error: msg, partial: true }, 10 * 60 * 1000);
+            setC(runKey(u), { ok: false, error: msg, partial: true }, 10 * 60 * 1000);
           }
 
           lastProgressAt = now();
@@ -518,11 +530,11 @@ function processBatchFast(urls) {
       continue;
     }
 
-    const cached = getC(`run:${u}`);
+    const cached = getC(runKey(u));
 
     if (cached) {
       if (!cached.ok && isBrowserClosedError(cached.error)) {
-        cache.delete(`run:${u}`);
+        cache.delete(runKey(u));
         results[i] = { ok: false, error: "PENDING", partial: true };
         missing.push(u);
       } else {
