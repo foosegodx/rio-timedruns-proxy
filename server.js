@@ -3,24 +3,28 @@ import fetch from "node-fetch";
 import { chromium } from "playwright";
 
 const app = express();
-app.use(express.json({ limit: "1mb" })); // <-- нужно для batch (POST JSON)
 const PORT = process.env.PORT || 3000;
 
 const cache = new Map();
-const TTL_MS = 6 * 60 * 60 * 1000;
+const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
 const regions = ["eu", "us", "kr", "tw", "cn"];
+
+function now() {
+  return Date.now();
+}
 
 function getC(k) {
   const v = cache.get(k);
   if (!v) return null;
-  if (Date.now() > v.exp) {
+  if (now() > v.exp) {
     cache.delete(k);
     return null;
   }
   return v.val;
 }
+
 function setC(k, val) {
-  cache.set(k, { val, exp: Date.now() + TTL_MS });
+  cache.set(k, { val: val, exp: now() + TTL_MS });
 }
 
 function normalizeRealm(realmRaw) {
@@ -62,6 +66,7 @@ async function fetchRunRoster(runUrl) {
     .filter(Boolean)
     .map((c) => {
       const name = c.name;
+
       const realmRaw =
         c.realmSlug ||
         c.realm ||
@@ -72,7 +77,8 @@ async function fetchRunRoster(runUrl) {
 
       const realm = normalizeRealm(realmRaw);
       if (!name || !realm) return null;
-      return { name: String(name), realm };
+
+      return { name: String(name), realm: realm };
     })
     .filter(Boolean);
 
@@ -80,15 +86,19 @@ async function fetchRunRoster(runUrl) {
   return roster;
 }
 
+// устойчивый парсер 5+ Timed Runs
 function parseTimed5(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
 
+  // 1) "23 5+ Keystone Timed Runs"
   let m = t.match(/(\d[\d,]*)\s+5\+\s+Keystone\s+Timed\s+Runs/i);
   if (m) return Number(String(m[1]).replace(/,/g, ""));
 
+  // 2) без Keystone
   m = t.match(/(\d[\d,]*)\s+5\+\s+Timed\s+Runs/i);
   if (m) return Number(String(m[1]).replace(/,/g, ""));
 
+  // 3) около "Timed Runs"
   const idx = t.toLowerCase().indexOf("timed runs");
   if (idx !== -1) {
     const slice = t.slice(Math.max(0, idx - 300), idx + 300);
@@ -96,6 +106,7 @@ function parseTimed5(text) {
     if (m) return Number(String(m[1]).replace(/,/g, ""));
   }
 
+  // 4) fallback
   m = t.match(/(\d[\d,]*)\s+5\+\s+.*?\s+Runs/i);
   if (m) return Number(String(m[1]).replace(/,/g, ""));
 
@@ -105,7 +116,7 @@ function parseTimed5(text) {
 async function fetchTimed5(browser, realm, name) {
   const ck = `t5:${realm}:${name}`;
   const cached = getC(ck);
-  if (cached !== null) return cached;
+  if (cached !== null) return cached; // число или null
 
   for (const region of regions) {
     const page = await browser.newPage({
@@ -125,6 +136,7 @@ async function fetchTimed5(browser, realm, name) {
     try {
       await page.goto(url, { waitUntil: "networkidle", timeout: 45000 });
 
+      // ждём, пока появится Timed Runs (если есть)
       try {
         await page.waitForSelector('text=/Timed Runs/i', { timeout: 8000 });
       } catch (_) {}
@@ -133,11 +145,13 @@ async function fetchTimed5(browser, realm, name) {
 
       const text = await page.evaluate(() => document.body?.innerText || "");
       const v = parseTimed5(text);
+
       if (typeof v === "number" && Number.isFinite(v)) {
         setC(ck, v);
         return v;
       }
     } catch (_) {
+      // ignore and try next region
     } finally {
       await page.close();
     }
@@ -158,7 +172,10 @@ async function lowestFromRunUrl(browser, runUrl) {
   for (const p of roster) {
     const t5 = await fetchTimed5(browser, p.realm, p.name);
     if (t5 === null) continue;
-    if (!best || t5 < best.t5) best = { name: p.name, realm: p.realm, t5: t5 };
+
+    if (!best || t5 < best.t5) {
+      best = { name: p.name, realm: p.realm, t5: t5 };
+    }
   }
 
   const out = best
@@ -171,7 +188,7 @@ async function lowestFromRunUrl(browser, runUrl) {
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// Старый (одиночный) endpoint оставляем
+// одиночный GET
 app.get("/lowest-from-run", async (req, res) => {
   const runUrl = req.query.url;
   if (!runUrl) return res.status(400).json({ ok: false, error: "missing url" });
@@ -184,29 +201,35 @@ app.get("/lowest-from-run", async (req, res) => {
 
     try {
       const out = await lowestFromRunUrl(browser, String(runUrl).trim());
-      res.json(out);
+      return res.json(out);
     } finally {
       await browser.close();
     }
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-/**
- * ✅ Новый batch endpoint:
- * POST /lowest-from-runs
- * Body: { "urls": ["https://...", "..."] }
- * Returns: { ok:true, results:[ {ok:true,lowest:...} or {ok:false,error:...}, ... ] }
- */
-app.post("/lowest-from-runs", async (req, res) => {
+// ✅ batch GET для Google Sheets custom functions
+// usage:
+// /lowest-from-runs-get?urls=BASE64(JSON.stringify(["url1","url2"]))
+app.get("/lowest-from-runs-get", async (req, res) => {
   try {
-    const urls = req.body && req.body.urls;
-    if (!urls || !Array.isArray(urls)) {
-      return res.status(400).json({ ok: false, error: "Body must be { urls: [...] }" });
+    const enc = req.query.urls;
+    if (!enc) return res.status(400).json({ ok: false, error: "missing urls param" });
+
+    let urls;
+    try {
+      const json = Buffer.from(String(enc), "base64").toString("utf8");
+      urls = JSON.parse(json);
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: "bad base64/json" });
     }
 
-    // фильтруем пустые и ограничим размер запроса
+    if (!Array.isArray(urls)) {
+      return res.status(400).json({ ok: false, error: "urls must be array" });
+    }
+
     const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
 
     const browser = await chromium.launch({
@@ -216,6 +239,7 @@ app.post("/lowest-from-runs", async (req, res) => {
 
     try {
       const results = [];
+
       for (let i = 0; i < clean.length; i++) {
         const u = clean[i];
         if (!u) {
