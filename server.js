@@ -16,7 +16,7 @@ const UA =
   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 // ---- НАСТРОЙКИ СТАБИЛЬНОСТИ ----
-const RUN_TIMEOUT_MS = 70_000;        // бюджет на 1 run (внутри вернём partial, если не успели)
+const RUN_TIMEOUT_MS = 120_000;        // бюджет на 1 run (внутри вернём partial, если не успели)
 const INFLIGHT_STALE_MS = 3 * 60_000; // если "в работе" > 3 мин — считаем зависшим
 const WORKER_BATCH = 6;               // сколько run-ов брать за раз из очереди
 
