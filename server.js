@@ -5,7 +5,7 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ✅ нужно для POST JSON
+// ✅ Нужно для POST JSON
 app.use(express.json({ limit: "1mb" }));
 
 const cache = new Map();
@@ -126,7 +126,6 @@ async function getContext() {
     const browser = await browserPromise;
     const context = await browser.newContext({ userAgent: UA });
 
-    // режем лишнее
     await context.route("**/*", (route) => {
       const rt = route.request().resourceType();
       if (!["document", "script", "xhr", "fetch"].includes(rt)) return route.abort();
@@ -206,7 +205,7 @@ function charKey(c) {
 async function fetchTimed5(context, realm, name, regionHint) {
   const ck = `t5:${(regionHint || "").toLowerCase()}:${realm}:${name}`.toLowerCase();
   const cached = getC(ck);
-  if (cached !== null) return cached; // число или null
+  if (cached !== null) return cached;
 
   const tryRegions = [];
   if (regionHint && regions.includes(regionHint)) tryRegions.push(regionHint);
@@ -281,14 +280,14 @@ async function lowestFromRun(context, runUrl, precomputedT5Map = null) {
   return out;
 }
 
-// ✅ общий процесс batch, чтобы не дублировать код (GET и POST используют одно и то же)
-async function processBatch(urls) {
+// --- Полный batch (может быть долгим) ---
+async function processBatchFull(urls) {
   const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
   const context = await getContext();
 
-  // 1) отдаём кешированные run:URL
   const results = new Array(clean.length).fill(null);
   const todo = [];
+
   for (let i = 0; i < clean.length; i++) {
     const u = clean[i];
     if (!u) {
@@ -302,7 +301,6 @@ async function processBatch(urls) {
 
   if (!todo.length) return results;
 
-  // 2) roster параллельно
   const rosterPacked = await mapLimit(todo, 10, async ({ i, u }) => {
     try {
       const roster = await fetchRunRoster(u);
@@ -312,7 +310,6 @@ async function processBatch(urls) {
     }
   });
 
-  // 3) дедуп персонажей и тянем timed5 ограниченной параллел.
   const uniqueChars = new Map();
   for (const r of rosterPacked) {
     if (!r.ok) continue;
@@ -325,7 +322,6 @@ async function processBatch(urls) {
     t5Map.set(charKey(c), v);
   });
 
-  // 4) считаем lowest для каждого run
   for (const r of rosterPacked) {
     if (!r.ok) {
       results[r.i] = { ok: false, error: r.error };
@@ -342,9 +338,59 @@ async function processBatch(urls) {
   return results;
 }
 
+// --- Быстрый batch: отдаём cache/PENDING и греем фон ---
+const inflightWarm = new Set();
+
+function warmInBackground(missingUrls) {
+  const uniq = [];
+  for (const u of missingUrls) {
+    if (!u) continue;
+    if (inflightWarm.has(u)) continue;
+    inflightWarm.add(u);
+    uniq.push(u);
+  }
+  if (!uniq.length) return;
+
+  (async () => {
+    try {
+      await processBatchFull(uniq);
+    } catch (e) {
+      console.error("warm error:", e);
+    } finally {
+      for (const u of uniq) inflightWarm.delete(u);
+    }
+  })();
+}
+
+function processBatchFast(urls) {
+  const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
+
+  const results = new Array(clean.length);
+  const missing = [];
+
+  for (let i = 0; i < clean.length; i++) {
+    const u = clean[i];
+    if (!u) {
+      results[i] = { ok: false, error: "empty url" };
+      continue;
+    }
+    const cached = getC(`run:${u}`);
+    if (cached) results[i] = cached;
+    else {
+      results[i] = { ok: false, error: "PENDING" };
+      missing.push(u);
+    }
+  }
+
+  // стартуем прогрев и сразу отдаём ответ
+  if (missing.length) warmInBackground(missing);
+
+  return results;
+}
+
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// одиночный GET
+// одиночный GET (для ручной проверки; может быть долгим)
 app.get("/lowest-from-run", async (req, res) => {
   const runUrl = req.query.url;
   if (!runUrl) return res.status(400).json({ ok: false, error: "missing url" });
@@ -358,7 +404,7 @@ app.get("/lowest-from-run", async (req, res) => {
   }
 });
 
-// batch GET (оставляем для совместимости, но он и будет упираться в URL length)
+// batch GET (старый; может упираться в длину URL)
 app.get("/lowest-from-runs-get", async (req, res) => {
   try {
     const enc = req.query.urls;
@@ -376,25 +422,25 @@ app.get("/lowest-from-runs-get", async (req, res) => {
       return res.status(400).json({ ok: false, error: "urls must be array" });
     }
 
-    const results = await processBatch(urls);
+    // ⚠️ GET оставляем как full (может быть долгим)
+    const results = await processBatchFull(urls);
     return res.json({ ok: true, results });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-// ✅ batch POST (главный, без лимита URL длины)
+// ✅ batch POST: по умолчанию FAST (cache/PENDING), но можно ?full=1
 app.post("/lowest-from-runs", async (req, res) => {
   try {
+    const full = String(req.query.full || "") === "1";
     const urls = Array.isArray(req.body) ? req.body : req.body?.urls;
 
     if (!Array.isArray(urls)) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "body must be array or { urls: array }" });
+      return res.status(400).json({ ok: false, error: "body must be array or { urls: array }" });
     }
 
-    const results = await processBatch(urls);
+    const results = full ? await processBatchFull(urls) : processBatchFast(urls);
     return res.json({ ok: true, results });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e.message || e) });
