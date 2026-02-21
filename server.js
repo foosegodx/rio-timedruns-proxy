@@ -248,26 +248,41 @@ function parseTimedRunsAll(text) {
 }
 
 /**
- * Достаём Discord из "Contact Info".
- * Обычно там два значения вида name#1234:
- *  - BattleTag
- *  - Discord
- * Берём ВТОРОЕ, если оно есть.
+ * ✅ Discord берём строго из Contact Info:
+ *  - находим BattleTag (строка с #1234)
+ *  - Discord = следующая строка (может быть без #, как "deaqaze")
  */
 function parseDiscordFromText(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const idx = t.toLowerCase().indexOf("contact info");
-  const slice = idx !== -1 ? t.slice(idx, idx + 1200) : t;
+  if (idx === -1) return null;
 
-  const matches = [];
-  const re = /([\p{L}\p{N}_.-]{2,32}#\d{4})/gu;
-  let m;
-  while ((m = re.exec(slice)) !== null) {
-    matches.push(m[1]);
+  let slice = t.slice(idx, idx + 1800);
+
+  // обрезаем по началу следующего большого блока (чтобы не ловить лишнее)
+  const cut = slice.search(/\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs)\b/i);
+  if (cut > 0) slice = slice.slice(0, cut);
+
+  const lines = slice
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s && s.toLowerCase() !== "contact info");
+
+  // BattleTag обычно имеет #1234
+  const btIdx = lines.findIndex((l) => /#\d{4}\b/.test(l));
+  if (btIdx === -1) return null;
+
+  // Discord обычно следующая строка после BattleTag
+  for (let i = btIdx + 1; i < lines.length; i++) {
+    const cand = lines[i];
+
+    // пропускаем URL / явные мусорные строки
+    if (/^https?:\/\//i.test(cand)) continue;
+    if (cand.length < 2 || cand.length > 40) continue;
+
+    return cand;
   }
 
-  if (matches.length >= 2) return matches[1];
-  if (matches.length === 1) return matches[0];
   return null;
 }
 
