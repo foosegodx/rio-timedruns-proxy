@@ -7,8 +7,8 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "1mb" }));
 
-// ✅ bump версии кэша (чтобы сразу пересчитать warband)
-const CACHE_VER = "v5";
+// ✅ bump версии кэша (чтобы warband пересчитался)
+const CACHE_VER = "v7";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -31,7 +31,7 @@ const PARTIAL_RETRY_MAX = 2;
 const PARTIAL_RETRY_DELAY_MS = 30_000;
 const partialAttempts = new Map(); // runUrl -> attempts
 
-// лимит на warband (чтобы не зависать)
+// warband попытка (чтобы не зависать)
 const WAR_BAND_TIMEOUT_MS = 15_000;
 
 const runKey = (u) => `run:${CACHE_VER}:${u}`;
@@ -330,6 +330,182 @@ function parseDiscordFromText(text) {
   return null;
 }
 
+// ----- WAR BAND helpers -----
+
+async function detectHasWarband(page) {
+  try {
+    const n = await page
+      .locator('a:has-text("Warband"), button:has-text("Warband"), [role="tab"]:has-text("Warband")')
+      .count();
+    if (n > 0) return true;
+  } catch {}
+
+  try {
+    const has = await page.evaluate(() => /\bwarband\b/i.test(document.body?.innerText || ""));
+    return !!has;
+  } catch {
+    return false;
+  }
+}
+
+async function findWarbandUrlFromPage(page) {
+  const href = await page
+    .evaluate(() => {
+      const abs = (raw) => {
+        if (!raw) return null;
+        if (/^https?:\/\//i.test(raw)) return raw;
+        if (raw.startsWith("/")) return new URL(raw, location.origin).toString();
+        return null;
+      };
+
+      const a1 = Array.from(document.querySelectorAll("a[href]")).find((a) =>
+        /warband/i.test(a.getAttribute("href") || "")
+      );
+      if (a1) return abs(a1.getAttribute("href"));
+
+      const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const els = Array.from(document.querySelectorAll("a,button,[role='tab']"));
+      const hit = els.find((el) => norm(el.textContent).includes("warband"));
+      if (!hit) return null;
+
+      const a = hit.closest("a");
+      const raw =
+        (a && a.getAttribute("href")) ||
+        hit.getAttribute("href") ||
+        hit.getAttribute("to") ||
+        (hit.dataset && (hit.dataset.href || hit.dataset.to || hit.dataset.url)) ||
+        null;
+
+      return abs(raw);
+    })
+    .catch(() => null);
+
+  if (href) return href;
+
+  const fromScripts = await page
+    .evaluate(() => {
+      const abs = (raw) => {
+        if (!raw) return null;
+        if (/^https?:\/\//i.test(raw)) return raw;
+        if (raw.startsWith("/")) return new URL(raw, location.origin).toString();
+        return null;
+      };
+
+      const candidates = new Set();
+      const re = /"((?:\/)[^"\\]*warband[^"\\]*)"/gi;
+
+      const scripts = Array.from(document.querySelectorAll("script"));
+      for (const s of scripts) {
+        const txt = s.textContent || "";
+        if (!txt || txt.length > 2_000_000) continue;
+        if (!/warband/i.test(txt)) continue;
+
+        let m;
+        while ((m = re.exec(txt)) !== null) candidates.add(m[1]);
+
+        if (s.id === "__NEXT_DATA__" || s.type === "application/json") {
+          try {
+            const json = JSON.parse(txt);
+            const stack = [json];
+            while (stack.length) {
+              const cur = stack.pop();
+              if (!cur) continue;
+              if (typeof cur === "string") {
+                if (cur.includes("warband") && cur.startsWith("/")) candidates.add(cur);
+                continue;
+              }
+              if (Array.isArray(cur)) {
+                for (const x of cur) stack.push(x);
+                continue;
+              }
+              if (typeof cur === "object") {
+                for (const k of Object.keys(cur)) stack.push(cur[k]);
+              }
+            }
+          } catch {}
+        }
+      }
+
+      const canon = document.querySelector('link[rel="canonical"]')?.href || null;
+      const og = document.querySelector('meta[property="og:url"]')?.content || null;
+      if (canon && /warband/i.test(canon)) return canon;
+      if (og && /warband/i.test(og)) return og;
+
+      for (const c of candidates) {
+        const u = abs(c);
+        if (u) return u;
+      }
+      return null;
+    })
+    .catch(() => null);
+
+  return fromScripts || null;
+}
+
+async function fetchWarbandUrl(context, region, realm, name) {
+  const ck = wbKey(region, realm, name);
+  const cached = getC(ck);
+  if (cached !== null) return cached; // string | null
+
+  const profileUrl = `https://raider.io/characters/${region}/${encodeURIComponent(realm)}/${encodeURIComponent(
+    name
+  )}`;
+
+  const page = await context.newPage();
+  page.setDefaultTimeout(15000);
+  page.setDefaultNavigationTimeout(15000);
+
+  try {
+    await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+
+    const hasWar = await detectHasWarband(page);
+    if (!hasWar) {
+      setC(ck, null);
+      return null;
+    }
+
+    // 1) без клика
+    let url = await findWarbandUrlFromPage(page);
+    if (url) {
+      setC(ck, url);
+      return url;
+    }
+
+    // 2) клик по Warband и повтор
+    const before = page.url();
+    await page
+      .locator('a:has-text("Warband"), button:has-text("Warband"), [role="tab"]:has-text("Warband")')
+      .first()
+      .click({ timeout: 6000 })
+      .catch(() => {});
+
+    for (let i = 0; i < 10; i++) {
+      await page.waitForTimeout(300);
+      const after = page.url();
+      if (after && after !== before && /warband/i.test(after)) {
+        setC(ck, after);
+        return after;
+      }
+    }
+
+    url = await findWarbandUrlFromPage(page);
+    if (url) {
+      setC(ck, url);
+      return url;
+    }
+
+    // 3) Warband есть, но URL не найден (SPA) — даём fallback-ссылку
+    const fallback = profileUrl + "?tab=warband";
+    setC(ck, fallback);
+    return fallback;
+  } catch {
+    setC(ck, null);
+    return null;
+  } finally {
+    await page.close();
+  }
+}
+
 /**
  * ✅ Возвращает { total, by, regionUsed, discord } или null
  */
@@ -379,146 +555,6 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
 
   setC(ck, null);
   return null;
-}
-
-// ---------- WAR BAND ----------
-
-async function findWarbandHref(page) {
-  try {
-    return await page.evaluate(() => {
-      const abs = (raw) => {
-        if (!raw) return null;
-        if (/^https?:\/\//i.test(raw)) return raw;
-        return new URL(raw, location.origin).toString();
-      };
-
-      // 1) если где-то есть явная ссылка с warband
-      const a1 = Array.from(document.querySelectorAll("a[href]")).find((a) =>
-        /warband/i.test(a.getAttribute("href") || "")
-      );
-      if (a1) return abs(a1.getAttribute("href"));
-
-      // 2) ищем элемент таба/кнопки по тексту и пробуем вытащить href/to/data-*
-      const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
-      const els = Array.from(document.querySelectorAll("a,button,[role='tab']"));
-      const hit = els.find((el) => norm(el.textContent).includes("warband"));
-      if (!hit) return null;
-
-      const a = hit.closest("a");
-      const raw =
-        (a && a.getAttribute("href")) ||
-        hit.getAttribute("href") ||
-        hit.getAttribute("to") ||
-        (hit.dataset && (hit.dataset.href || hit.dataset.to || hit.dataset.url)) ||
-        null;
-
-      return abs(raw);
-    });
-  } catch {
-    return null;
-  }
-}
-
-async function fetchWarbandUrl(context, region, realm, name) {
-  const ck = wbKey(region, realm, name);
-  const cached = getC(ck);
-  if (cached !== null) return cached; // string | null
-
-  const profileUrl = `https://raider.io/characters/${region}/${encodeURIComponent(realm)}/${encodeURIComponent(
-    name
-  )}`;
-
-  const page = await context.newPage();
-  page.setDefaultTimeout(15000);
-  page.setDefaultNavigationTimeout(15000);
-
-  try {
-    await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
-
-    const tab = page
-      .locator('a:has-text("Warband"), button:has-text("Warband"), [role="tab"]:has-text("Warband")')
-      .first();
-
-    if ((await tab.count()) === 0) {
-      setC(ck, null);
-      return null;
-    }
-
-    // A) сначала пробуем найти href без клика
-    let href = await findWarbandHref(page);
-    if (href) {
-      setC(ck, href);
-      return href;
-    }
-
-    // B) кликаем Warband и снова пытаемся найти href/URL
-    const before = page.url();
-
-    try {
-      await tab.click({ timeout: 6000 });
-    } catch {
-      // если клик не удался — всё равно попробуем угадать
-    }
-
-    // ждём потенциальной навигации/смены url
-    try {
-      await page.waitForURL(/warband/i, { timeout: 6000 });
-    } catch (_) {}
-
-    href = await findWarbandHref(page);
-    if (href) {
-      setC(ck, href);
-      return href;
-    }
-
-    // canonical / og:url иногда меняются при табах
-    const metaUrl = await page.evaluate(() => {
-      const canon = document.querySelector('link[rel="canonical"]')?.href || null;
-      const og = document.querySelector('meta[property="og:url"]')?.content || null;
-      return canon || og || null;
-    });
-    if (metaUrl && /warband/i.test(metaUrl)) {
-      setC(ck, metaUrl);
-      return metaUrl;
-    }
-
-    const after = page.url();
-    if (after && after !== before && /warband/i.test(after)) {
-      setC(ck, after);
-      return after;
-    }
-
-    // C) если SPA не меняет URL — пробуем самые частые шаблоны
-    const candidates = [
-      `${profileUrl}/warband`,
-      `${profileUrl}?view=warband`,
-      `${profileUrl}?tab=warband`,
-      `${profileUrl}#warband`,
-    ];
-
-    for (const cand of candidates) {
-      try {
-        const resp = await page.goto(cand, { waitUntil: "domcontentloaded", timeout: 8000 });
-        if (resp && resp.ok()) {
-          const finalUrl = page.url();
-          if (/warband/i.test(finalUrl) || /warband/i.test(cand)) {
-            setC(ck, finalUrl);
-            return finalUrl;
-          }
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    setC(ck, null);
-    return null;
-  } catch {
-    setC(ck, null);
-    return null;
-  } finally {
-    await page.close();
-  }
 }
 
 // --- lowest for run ---
@@ -689,59 +725,8 @@ setInterval(() => {
 }, 30_000);
 
 /* =======================
-   Routes
+   Batch endpoints
    ======================= */
-app.get("/health", (_, res) => res.json({ ok: true }));
-
-app.get("/debug", (_, res) => {
-  res.json({
-    ok: true,
-    cacheSize: cache.size,
-    queueLen: runQueue.length,
-    queued: queued.size,
-    inflight: inflight.size,
-    workerRunning,
-    lastProgressSecAgo: Math.round((now() - lastProgressAt) / 1000),
-  });
-});
-
-app.get("/lowest-from-run", async (req, res) => {
-  const runUrl = req.query.url;
-  if (!runUrl) return res.status(400).json({ ok: false, error: "missing url" });
-
-  try {
-    const context = await getContext();
-    const out = await lowestFromRun(context, String(runUrl).trim());
-    return res.json(out);
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-app.get("/lowest-from-runs-get", async (req, res) => {
-  try {
-    const enc = req.query.urls;
-    if (!enc) return res.status(400).json({ ok: false, error: "missing urls param" });
-
-    let urls;
-    try {
-      const json = decodeBase64WebSafeToUtf8(enc);
-      urls = JSON.parse(json);
-    } catch {
-      return res.status(400).json({ ok: false, error: "bad base64/json" });
-    }
-
-    if (!Array.isArray(urls)) {
-      return res.status(400).json({ ok: false, error: "urls must be array" });
-    }
-
-    const results = await processBatchFull(urls);
-    return res.json({ ok: true, results });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
 function processBatchFast(urls) {
   const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
 
@@ -794,6 +779,60 @@ async function processBatchFull(urls) {
 
   return out;
 }
+
+/* =======================
+   Routes
+   ======================= */
+app.get("/health", (_, res) => res.json({ ok: true }));
+
+app.get("/debug", (_, res) => {
+  res.json({
+    ok: true,
+    cacheSize: cache.size,
+    queueLen: runQueue.length,
+    queued: queued.size,
+    inflight: inflight.size,
+    workerRunning,
+    lastProgressSecAgo: Math.round((now() - lastProgressAt) / 1000),
+  });
+});
+
+app.get("/lowest-from-run", async (req, res) => {
+  const runUrl = req.query.url;
+  if (!runUrl) return res.status(400).json({ ok: false, error: "missing url" });
+
+  try {
+    const context = await getContext();
+    const out = await lowestFromRun(context, String(runUrl).trim());
+    return res.json(out);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+app.get("/lowest-from-runs-get", async (req, res) => {
+  try {
+    const enc = req.query.urls;
+    if (!enc) return res.status(400).json({ ok: false, error: "missing urls param" });
+
+    let urls;
+    try {
+      const json = decodeBase64WebSafeToUtf8(enc);
+      urls = JSON.parse(json);
+    } catch {
+      return res.status(400).json({ ok: false, error: "bad base64/json" });
+    }
+
+    if (!Array.isArray(urls)) {
+      return res.status(400).json({ ok: false, error: "urls must be array" });
+    }
+
+    const results = await processBatchFull(urls);
+    return res.json({ ok: true, results });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
 
 app.post("/lowest-from-runs", async (req, res) => {
   try {
