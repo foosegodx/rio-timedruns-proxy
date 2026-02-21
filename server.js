@@ -5,7 +5,7 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ✅ Нужно для POST JSON
+// нужно для POST JSON
 app.use(express.json({ limit: "1mb" }));
 
 const cache = new Map();
@@ -71,10 +71,18 @@ function decodeBase64WebSafeToUtf8(enc) {
 function parseTimed5(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
 
+  // число слева
   let m = t.match(/(\d[\d,]*)\s+5\+\s+Keystone\s+Timed\s+Runs/i);
   if (m) return Number(String(m[1]).replace(/,/g, ""));
 
+  // число справа (иногда бывает так)
+  m = t.match(/5\+\s+Keystone\s+Timed\s+Runs\s+(\d[\d,]*)/i);
+  if (m) return Number(String(m[1]).replace(/,/g, ""));
+
   m = t.match(/(\d[\d,]*)\s+5\+\s+Timed\s+Runs/i);
+  if (m) return Number(String(m[1]).replace(/,/g, ""));
+
+  m = t.match(/5\+\s+Timed\s+Runs\s+(\d[\d,]*)/i);
   if (m) return Number(String(m[1]).replace(/,/g, ""));
 
   const idx = t.toLowerCase().indexOf("timed runs");
@@ -126,6 +134,7 @@ async function getContext() {
     const browser = await browserPromise;
     const context = await browser.newContext({ userAgent: UA });
 
+    // режем всё лишнее
     await context.route("**/*", (route) => {
       const rt = route.request().resourceType();
       if (!["document", "script", "xhr", "fetch"].includes(rt)) return route.abort();
@@ -205,7 +214,7 @@ function charKey(c) {
 async function fetchTimed5(context, realm, name, regionHint) {
   const ck = `t5:${(regionHint || "").toLowerCase()}:${realm}:${name}`.toLowerCase();
   const cached = getC(ck);
-  if (cached !== null) return cached;
+  if (cached !== null) return cached; // число или null
 
   const tryRegions = [];
   if (regionHint && regions.includes(regionHint)) tryRegions.push(regionHint);
@@ -213,25 +222,27 @@ async function fetchTimed5(context, realm, name, regionHint) {
 
   for (const region of tryRegions) {
     const page = await context.newPage();
-    page.setDefaultTimeout(12000);
-    page.setDefaultNavigationTimeout(12000);
+    page.setDefaultTimeout(15000);
+    page.setDefaultNavigationTimeout(15000);
 
     const url = `https://raider.io/characters/${region}/${encodeURIComponent(realm)}/${encodeURIComponent(
       name
     )}`;
 
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 12000 });
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
 
+      // пробуем быстро найти точечный текст
       let txt = null;
       try {
         const loc = page.locator("text=/5\\+\\s+Keystone\\s+Timed\\s+Runs/i").first();
-        await loc.waitFor({ timeout: 5000 });
+        await loc.waitFor({ timeout: 4000 });
         txt = await loc.textContent({ timeout: 2000 });
       } catch {}
 
       let v = txt ? parseTimed5(txt) : null;
 
+      // fallback: весь текст страницы
       if (v === null) {
         const bodyText = await page.evaluate(() => document.body?.innerText || "");
         v = parseTimed5(bodyText);
@@ -252,7 +263,7 @@ async function fetchTimed5(context, realm, name, regionHint) {
   return null;
 }
 
-// --- Lowest для одного run ---
+// ✅ Lowest для одного run: теперь null считаем как 0 (поэтому "no timed5 found" не будет)
 async function lowestFromRun(context, runUrl, precomputedT5Map = null) {
   const runCacheKey = `run:${runUrl}`;
   const cached = getC(runCacheKey);
@@ -261,20 +272,27 @@ async function lowestFromRun(context, runUrl, precomputedT5Map = null) {
   const roster = await fetchRunRoster(runUrl);
 
   let best = null;
+
   for (const p of roster) {
     const k = charKey(p);
-    const t5 =
+
+    const t5raw =
       precomputedT5Map && precomputedT5Map.has(k)
         ? precomputedT5Map.get(k)
         : await fetchTimed5(context, p.realm, p.name, p.region);
 
-    if (t5 === null) continue;
-    if (!best || t5 < best.t5) best = { name: p.name, realm: p.realm, t5 };
+    const t5 = (t5raw === null) ? 0 : t5raw; // ✅ ключевое изменение
+
+    if (!best || t5 < best.t5) {
+      best = { name: p.name, realm: p.realm, t5 };
+    }
   }
 
-  const out = best
-    ? { ok: true, lowest: `${best.name}-${best.realm}`.toLowerCase(), timed5: best.t5 }
-    : { ok: false, error: "no timed5 found" };
+  const out = {
+    ok: true,
+    lowest: `${best.name}-${best.realm}`.toLowerCase(),
+    timed5: best.t5,
+  };
 
   setC(runCacheKey, out);
   return out;
@@ -382,7 +400,6 @@ function processBatchFast(urls) {
     }
   }
 
-  // стартуем прогрев и сразу отдаём ответ
   if (missing.length) warmInBackground(missing);
 
   return results;
@@ -390,7 +407,7 @@ function processBatchFast(urls) {
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// одиночный GET (для ручной проверки; может быть долгим)
+// одиночный GET (для ручной проверки)
 app.get("/lowest-from-run", async (req, res) => {
   const runUrl = req.query.url;
   if (!runUrl) return res.status(400).json({ ok: false, error: "missing url" });
@@ -404,7 +421,7 @@ app.get("/lowest-from-run", async (req, res) => {
   }
 });
 
-// batch GET (старый; может упираться в длину URL)
+// batch GET (старый)
 app.get("/lowest-from-runs-get", async (req, res) => {
   try {
     const enc = req.query.urls;
@@ -422,7 +439,6 @@ app.get("/lowest-from-runs-get", async (req, res) => {
       return res.status(400).json({ ok: false, error: "urls must be array" });
     }
 
-    // ⚠️ GET оставляем как full (может быть долгим)
     const results = await processBatchFull(urls);
     return res.json({ ok: true, results });
   } catch (e) {
@@ -430,7 +446,7 @@ app.get("/lowest-from-runs-get", async (req, res) => {
   }
 });
 
-// ✅ batch POST: по умолчанию FAST (cache/PENDING), но можно ?full=1
+// batch POST: по умолчанию FAST, но можно ?full=1
 app.post("/lowest-from-runs", async (req, res) => {
   try {
     const full = String(req.query.full || "") === "1";
