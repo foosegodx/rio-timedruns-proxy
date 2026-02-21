@@ -15,6 +15,13 @@ const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
+// ---- НАСТРОЙКИ СТАБИЛЬНОСТИ ----
+const RUN_TIMEOUT_MS = 70_000;        // максимум на 1 run
+const INFLIGHT_STALE_MS = 3 * 60_000; // если "в работе" > 3 мин — считаем зависшим
+const WORKER_BATCH = 4;               // сколько run-ов брать за раз из очереди
+const WORKER_PARALLEL = 2;            // сколько run-ов считать параллельно в воркере
+const PER_RUN_PARALLEL = 2;           // сколько персонажей параллельно внутри 1 run
+
 function now() {
   return Date.now();
 }
@@ -66,7 +73,6 @@ function decodeBase64WebSafeToUtf8(enc) {
   return Buffer.from(b64, "base64").toString("utf8");
 }
 
-// --- лимитер параллелизма ---
 async function mapLimit(items, limit, fn) {
   const arr = Array.from(items);
   const out = new Array(arr.length);
@@ -84,9 +90,36 @@ async function mapLimit(items, limit, fn) {
   return out;
 }
 
+function withTimeout(promiseFactory, ms, label = "timeout") {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(label)), ms);
+    Promise.resolve()
+      .then(promiseFactory)
+      .then((v) => {
+        clearTimeout(t);
+        resolve(v);
+      })
+      .catch((e) => {
+        clearTimeout(t);
+        reject(e);
+      });
+  });
+}
+
 // --- Playwright singleton ---
 let browserPromise = null;
 let contextPromise = null;
+
+async function resetBrowser() {
+  try {
+    if (browserPromise) {
+      const b = await browserPromise;
+      await b.close();
+    }
+  } catch {}
+  browserPromise = null;
+  contextPromise = null;
+}
 
 async function getContext() {
   if (contextPromise) return contextPromise;
@@ -102,7 +135,6 @@ async function getContext() {
     const browser = await browserPromise;
     const context = await browser.newContext({ userAgent: UA });
 
-    // режем лишнее
     await context.route("**/*", (route) => {
       const rt = route.request().resourceType();
       if (!["document", "script", "xhr", "fetch"].includes(rt)) return route.abort();
@@ -127,7 +159,7 @@ async function shutdown() {
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
-// --- Raider.IO run-details roster ---
+// --- run-details roster ---
 async function fetchRunRoster(runUrl) {
   const m = String(runUrl).match(/\/mythic-plus-runs\/(season-[^/]+)\/(\d+)-/i);
   if (!m) throw new Error("Bad URL");
@@ -175,18 +207,10 @@ async function fetchRunRoster(runUrl) {
 }
 
 /**
- * ✅ Парсим ВСЕ "X+ Keystone Timed Runs" и достаём числа.
- * Возвращает:
- *  { total: number, by: { "5+": 20, "10+": 272, ... } }
- * или null, если не нашли ни одной плитки.
- *
- * Поддерживает оба порядка:
- *  "270 15+ Keystone Timed Runs"
- *  "15+ Keystone Timed Runs 270"
+ * Парсим все "X+ Keystone Timed Runs" и суммируем.
  */
 function parseTimedRunsAll(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
-
   const by = {};
 
   const p1 = /(\d[\d,]*)\s+(\d{1,2}\+)\s+Keystone\s+Timed\s+Runs/gi;
@@ -211,11 +235,6 @@ function parseTimedRunsAll(text) {
   return { total, by };
 }
 
-/**
- * ✅ Получаем TOTAL (сумму всех плиток) для персонажа.
- * Возвращает:
- *  { total, by } или null (если вообще не нашли статистику).
- */
 async function fetchTimedTotal(context, realm, name, regionHint) {
   const ck = `tt:${(regionHint || "").toLowerCase()}:${realm}:${name}`.toLowerCase();
   const cached = getC(ck);
@@ -237,7 +256,6 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
 
-      // ждём, пока появится блок со словами "Keystone Timed Runs" (если он вообще есть)
       try {
         await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 6000 });
       } catch (_) {}
@@ -256,12 +274,11 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
     }
   }
 
-  // статистику не нашли ни в одном регионе
   setC(ck, null);
   return null;
 }
 
-// ✅ Lowest для одного run: сравниваем по total (сумме)
+// --- Lowest для одного run ---
 async function lowestFromRun(context, runUrl) {
   const runCacheKey = `run:${runUrl}`;
   const cached = getC(runCacheKey);
@@ -269,16 +286,14 @@ async function lowestFromRun(context, runUrl) {
 
   const roster = await fetchRunRoster(runUrl);
 
-  // получаем totals по участникам (немного параллелим)
-  const totals = await mapLimit(roster, 3, async (p) => {
+  const totals = await mapLimit(roster, PER_RUN_PARALLEL, async (p) => {
     const stat = await fetchTimedTotal(context, p.realm, p.name, p.region);
-    return { p, stat }; // stat = {total, by} или null
+    return { p, stat };
   });
 
-  // выбираем минимальный total среди тех, у кого stat найден
   let best = null;
   for (const it of totals) {
-    if (!it.stat) continue; // если не нашли вообще — не используем, чтобы не выбрать случайно
+    if (!it.stat) continue;
     if (!best || it.stat.total < best.stat.total) best = it;
   }
 
@@ -295,19 +310,30 @@ async function lowestFromRun(context, runUrl) {
   return out;
 }
 
-/* =========================================================
-   ✅ Очередь прогрева (чтобы 100 ссылок не стояли PENDING вечность)
-   ========================================================= */
+/* =======================
+   Очередь + воркер
+   ======================= */
 const runQueue = [];
 const queued = new Set();
-const inflight = new Set();
+// inflight: url -> startedAt
+const inflight = new Map();
 let workerRunning = false;
+let lastProgressAt = now();
 
 function enqueueRuns(urls) {
+  const t = now();
   for (const u0 of urls) {
     const u = String(u0 || "").trim();
     if (!u) continue;
+
     if (getC(`run:${u}`)) continue;
+
+    // если inflight завис — переочередим
+    const startedAt = inflight.get(u);
+    if (startedAt && t - startedAt > INFLIGHT_STALE_MS) {
+      inflight.delete(u);
+    }
+
     if (queued.has(u) || inflight.has(u)) continue;
     queued.add(u);
     runQueue.push(u);
@@ -320,33 +346,79 @@ async function startWorker() {
   workerRunning = true;
 
   (async () => {
-    const context = await getContext();
+    let context = await getContext();
 
     while (runQueue.length) {
-      const batch = runQueue.splice(0, 6);
+      // берём пачку
+      const batch = runQueue.splice(0, WORKER_BATCH);
       for (const u of batch) {
         queued.delete(u);
-        inflight.add(u);
+        inflight.set(u, now());
       }
 
-      await mapLimit(batch, 2, async (u) => {
+      await mapLimit(batch, WORKER_PARALLEL, async (u) => {
         try {
-          await lowestFromRun(context, u);
+          const out = await withTimeout(
+            () => lowestFromRun(context, u),
+            RUN_TIMEOUT_MS,
+            "run_timeout"
+          );
+          setC(`run:${u}`, out);
+          lastProgressAt = now();
         } catch (e) {
-          setC(`run:${u}`, { ok: false, error: String(e.message || e) });
+          // если Playwright умер — сбросим браузер и попробуем восстановиться
+          const msg = String(e?.message || e);
+          if (/Target closed|browser has disconnected|Protocol error/i.test(msg)) {
+            await resetBrowser();
+            context = await getContext();
+          }
+          setC(`run:${u}`, { ok: false, error: msg });
+          lastProgressAt = now();
         } finally {
           inflight.delete(u);
         }
       });
     }
   })()
-    .catch((e) => console.error("worker fatal:", e))
+    .catch(async (e) => {
+      console.error("worker fatal:", e);
+      // если воркер упал — все inflight вернём обратно в очередь
+      for (const [u] of inflight.entries()) {
+        inflight.delete(u);
+        if (!queued.has(u) && !getC(`run:${u}`)) {
+          queued.add(u);
+          runQueue.push(u);
+        }
+      }
+      await resetBrowser();
+    })
     .finally(() => {
       workerRunning = false;
       if (runQueue.length) startWorker();
     });
 }
 
+// watchdog: если воркер завис — перезапустим
+setInterval(() => {
+  const t = now();
+  if (workerRunning && t - lastProgressAt > INFLIGHT_STALE_MS) {
+    console.log("watchdog: no progress, restarting worker");
+    // пометим inflight как зависшие и вернём в очередь
+    for (const [u] of inflight.entries()) {
+      inflight.delete(u);
+      if (!queued.has(u) && !getC(`run:${u}`)) {
+        queued.add(u);
+        runQueue.push(u);
+      }
+    }
+    workerRunning = false;
+    resetBrowser().finally(() => startWorker());
+  }
+}, 30_000);
+
+/* =======================
+   Batch FAST / FULL
+   ======================= */
 function processBatchFast(urls) {
   const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
 
@@ -387,12 +459,11 @@ async function processBatchFull(urls) {
   return out;
 }
 
-/* =========================================================
+/* =======================
    Endpoints
-   ========================================================= */
+   ======================= */
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// прогресс очереди
 app.get("/debug", (_, res) => {
   res.json({
     ok: true,
@@ -401,10 +472,10 @@ app.get("/debug", (_, res) => {
     queued: queued.size,
     inflight: inflight.size,
     workerRunning,
+    lastProgressSecAgo: Math.round((now() - lastProgressAt) / 1000),
   });
 });
 
-// одиночный GET (проверка)
 app.get("/lowest-from-run", async (req, res) => {
   const runUrl = req.query.url;
   if (!runUrl) return res.status(400).json({ ok: false, error: "missing url" });
@@ -418,7 +489,6 @@ app.get("/lowest-from-run", async (req, res) => {
   }
 });
 
-// legacy GET
 app.get("/lowest-from-runs-get", async (req, res) => {
   try {
     const enc = req.query.urls;
@@ -443,7 +513,6 @@ app.get("/lowest-from-runs-get", async (req, res) => {
   }
 });
 
-// основной POST: fast по умолчанию, full=1 для ручной отладки
 app.post("/lowest-from-runs", async (req, res) => {
   try {
     const full = String(req.query.full || "") === "1";
