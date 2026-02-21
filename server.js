@@ -16,11 +16,16 @@ const UA =
   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 // ---- НАСТРОЙКИ СТАБИЛЬНОСТИ ----
-const RUN_TIMEOUT_MS = 70_000;        // максимум на 1 run
+const RUN_TIMEOUT_MS = 70_000;        // общий бюджет на 1 run (мы внутри вернем partial, если не успели)
 const INFLIGHT_STALE_MS = 3 * 60_000; // если "в работе" > 3 мин — считаем зависшим
 const WORKER_BATCH = 4;               // сколько run-ов брать за раз из очереди
 const WORKER_PARALLEL = 2;            // сколько run-ов считать параллельно в воркере
 const PER_RUN_PARALLEL = 2;           // сколько персонажей параллельно внутри 1 run
+
+// если partial — попробуем дорефайнить позже (пару раз)
+const PARTIAL_RETRY_MAX = 2;
+const PARTIAL_RETRY_DELAY_MS = 30_000;
+const partialAttempts = new Map(); // runUrl -> attempts
 
 function now() {
   return Date.now();
@@ -34,8 +39,8 @@ function getC(k) {
   }
   return v.val;
 }
-function setC(k, val) {
-  cache.set(k, { val, exp: now() + TTL_MS });
+function setC(k, val, ttlMs = TTL_MS) {
+  cache.set(k, { val, exp: now() + ttlMs });
 }
 
 function normalizeRealm(realmRaw) {
@@ -88,22 +93,6 @@ async function mapLimit(items, limit, fn) {
 
   await Promise.all(workers);
   return out;
-}
-
-function withTimeout(promiseFactory, ms, label = "timeout") {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(label)), ms);
-    Promise.resolve()
-      .then(promiseFactory)
-      .then((v) => {
-        clearTimeout(t);
-        resolve(v);
-      })
-      .catch((e) => {
-        clearTimeout(t);
-        reject(e);
-      });
-  });
 }
 
 // --- Playwright singleton ---
@@ -278,7 +267,13 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
   return null;
 }
 
-// --- Lowest для одного run ---
+/**
+ * ✅ ВАЖНО: теперь lowestFromRun НИКОГДА не кидает run_timeout наружу.
+ * Он сам:
+ *  - имеет дедлайн (RUN_TIMEOUT_MS - запас)
+ *  - успел посчитать часть игроков -> вернет partial:true
+ *  - успел всех -> partial:false
+ */
 async function lowestFromRun(context, runUrl) {
   const runCacheKey = `run:${runUrl}`;
   const cached = getC(runCacheKey);
@@ -286,16 +281,23 @@ async function lowestFromRun(context, runUrl) {
 
   const roster = await fetchRunRoster(runUrl);
 
-  const totals = await mapLimit(roster, PER_RUN_PARALLEL, async (p) => {
-    const stat = await fetchTimedTotal(context, p.realm, p.name, p.region);
-    return { p, stat };
-  });
-
+  const deadline = Date.now() + (RUN_TIMEOUT_MS - 3000); // 3 сек запас
   let best = null;
-  for (const it of totals) {
-    if (!it.stat) continue;
-    if (!best || it.stat.total < best.stat.total) best = it;
+  let done = 0;
+
+  // последовательно по игрокам, чтобы гарантировать хоть какой-то результат
+  // (пер-рун параллелизм мы оставим в воркере/очереди)
+  for (const p of roster) {
+    if (Date.now() > deadline) break;
+
+    const stat = await fetchTimedTotal(context, p.realm, p.name, p.region);
+    done++;
+
+    if (!stat) continue;
+    if (!best || stat.total < best.stat.total) best = { p, stat };
   }
+
+  const partial = done < roster.length;
 
   const out = best
     ? {
@@ -303,10 +305,12 @@ async function lowestFromRun(context, runUrl) {
         lowest: `${best.p.name}-${best.p.realm}`.toLowerCase(),
         timed_total: best.stat.total,
         timed_breakdown: best.stat.by,
+        partial,
       }
-    : { ok: false, error: "no timed totals found" };
+    : { ok: false, error: "no timed totals found", partial: true };
 
-  setC(runCacheKey, out);
+  // Если partial — кэшируем на меньшее время, чтобы можно было дозавершить позже
+  setC(runCacheKey, out, partial ? 20 * 60 * 1000 : TTL_MS);
   return out;
 }
 
@@ -320,13 +324,14 @@ const inflight = new Map();
 let workerRunning = false;
 let lastProgressAt = now();
 
-function enqueueRuns(urls) {
+function enqueueRuns(urls, force = false) {
   const t = now();
   for (const u0 of urls) {
     const u = String(u0 || "").trim();
     if (!u) continue;
 
-    if (getC(`run:${u}`)) continue;
+    const cached = getC(`run:${u}`);
+    if (cached && cached.ok && !cached.partial && !force) continue;
 
     // если inflight завис — переочередим
     const startedAt = inflight.get(u);
@@ -335,6 +340,7 @@ function enqueueRuns(urls) {
     }
 
     if (queued.has(u) || inflight.has(u)) continue;
+
     queued.add(u);
     runQueue.push(u);
   }
@@ -349,7 +355,6 @@ async function startWorker() {
     let context = await getContext();
 
     while (runQueue.length) {
-      // берём пачку
       const batch = runQueue.splice(0, WORKER_BATCH);
       for (const u of batch) {
         queued.delete(u);
@@ -358,21 +363,28 @@ async function startWorker() {
 
       await mapLimit(batch, WORKER_PARALLEL, async (u) => {
         try {
-          const out = await withTimeout(
-            () => lowestFromRun(context, u),
-            RUN_TIMEOUT_MS,
-            "run_timeout"
-          );
-          setC(`run:${u}`, out);
+          const out = await lowestFromRun(context, u);
+          setC(`run:${u}`, out, out.partial ? 20 * 60 * 1000 : TTL_MS);
           lastProgressAt = now();
+
+          // если partial — попробуем дорефайнить (пару раз)
+          if (out.ok && out.partial) {
+            const n = partialAttempts.get(u) || 0;
+            if (n < PARTIAL_RETRY_MAX) {
+              partialAttempts.set(u, n + 1);
+              setTimeout(() => enqueueRuns([u], true), PARTIAL_RETRY_DELAY_MS);
+            }
+          }
         } catch (e) {
-          // если Playwright умер — сбросим браузер и попробуем восстановиться
           const msg = String(e?.message || e);
+
+          // если Playwright умер — сбросим браузер
           if (/Target closed|browser has disconnected|Protocol error/i.test(msg)) {
             await resetBrowser();
             context = await getContext();
           }
-          setC(`run:${u}`, { ok: false, error: msg });
+
+          setC(`run:${u}`, { ok: false, error: msg, partial: true }, 10 * 60 * 1000);
           lastProgressAt = now();
         } finally {
           inflight.delete(u);
@@ -382,10 +394,10 @@ async function startWorker() {
   })()
     .catch(async (e) => {
       console.error("worker fatal:", e);
-      // если воркер упал — все inflight вернём обратно в очередь
+      // если воркер упал — вернем inflight обратно в очередь
       for (const [u] of inflight.entries()) {
         inflight.delete(u);
-        if (!queued.has(u) && !getC(`run:${u}`)) {
+        if (!queued.has(u)) {
           queued.add(u);
           runQueue.push(u);
         }
@@ -403,10 +415,9 @@ setInterval(() => {
   const t = now();
   if (workerRunning && t - lastProgressAt > INFLIGHT_STALE_MS) {
     console.log("watchdog: no progress, restarting worker");
-    // пометим inflight как зависшие и вернём в очередь
     for (const [u] of inflight.entries()) {
       inflight.delete(u);
-      if (!queued.has(u) && !getC(`run:${u}`)) {
+      if (!queued.has(u)) {
         queued.add(u);
         runQueue.push(u);
       }
@@ -424,22 +435,28 @@ function processBatchFast(urls) {
 
   const results = new Array(clean.length);
   const missing = [];
+  const needRefine = [];
 
   for (let i = 0; i < clean.length; i++) {
     const u = clean[i];
     if (!u) {
-      results[i] = { ok: false, error: "empty url" };
+      results[i] = { ok: false, error: "empty url", partial: true };
       continue;
     }
+
     const cached = getC(`run:${u}`);
-    if (cached) results[i] = cached;
-    else {
-      results[i] = { ok: false, error: "PENDING" };
+    if (cached) {
+      results[i] = cached;
+      if (cached.ok && cached.partial) needRefine.push(u); // дозавершим в фоне
+    } else {
+      results[i] = { ok: false, error: "PENDING", partial: true };
       missing.push(u);
     }
   }
 
   if (missing.length) enqueueRuns(missing);
+  if (needRefine.length) enqueueRuns(needRefine, true);
+
   return results;
 }
 
@@ -448,11 +465,11 @@ async function processBatchFull(urls) {
   const context = await getContext();
 
   const out = await mapLimit(clean, 2, async (u) => {
-    if (!u) return { ok: false, error: "empty url" };
+    if (!u) return { ok: false, error: "empty url", partial: true };
     try {
       return await lowestFromRun(context, u);
     } catch (e) {
-      return { ok: false, error: String(e.message || e) };
+      return { ok: false, error: String(e.message || e), partial: true };
     }
   });
 
