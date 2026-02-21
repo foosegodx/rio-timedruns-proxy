@@ -7,7 +7,7 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "1mb" }));
 
-// ✅ bump версии кэша, чтобы заново перепарсить Discord
+// ✅ bump версии кэша (меняй на v3 если захочешь сбросить кэш ещё раз)
 const CACHE_VER = "v2";
 
 const cache = new Map();
@@ -257,14 +257,15 @@ function parseTimedRunsAll(text) {
 /**
  * ✅ Discord из Contact Info:
  * - если есть BattleTag (#1234) -> Discord = следующая строка (может быть без #)
- * - если BattleTag НЕТ -> берём первую строку, похожую на discord username (без #)
+ * - если BattleTag НЕТ -> берём первую строку, похожую на discord username (БЕЗ #)
+ * - отсекаем стоп-слова вроде "Loadout"
  */
 function parseDiscordFromText(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const idx = t.toLowerCase().indexOf("contact info");
   if (idx === -1) return null;
 
-  let slice = t.slice(idx, idx + 2000);
+  let slice = t.slice(idx, idx + 2200);
 
   const cut = slice.search(/\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs)\b/i);
   if (cut > 0) slice = slice.slice(0, cut);
@@ -274,30 +275,48 @@ function parseDiscordFromText(text) {
     .map((s) => s.trim())
     .filter((s) => s && s.toLowerCase() !== "contact info");
 
-  // удобные регэкспы
   const btRe = /#\d{4}\b/;
-  const discordNewRe = /^[\p{L}\p{N}_.-]{2,32}$/u;          // deaqaze / kaasklomp
-  const discordOldRe = /^[\p{L}\p{N}_.-]{2,32}#\d{4}$/u;    // old discord
+  const discordNewRe = /^[\p{L}\p{N}_.-]{2,32}$/u;       // kaasklomp / deaqaze
+  const discordOldRe = /^[\p{L}\p{N}_.-]{2,32}#\d{4}$/u; // Méq#6588
+
+  const stop = new Set([
+    "loadout",
+    "gear",
+    "talents",
+    "profile",
+    "contact",
+    "info",
+    "external",
+    "links",
+    "recent",
+    "runs",
+    "mythic+",
+    "mythic",
+    "raid",
+    "progression",
+  ]);
+  const isStopWord = (s) => stop.has(String(s || "").toLowerCase());
 
   const btIdx = lines.findIndex((l) => btRe.test(l));
 
+  // Есть BattleTag -> discord обычно следующая строка
   if (btIdx !== -1) {
-    // Discord обычно следующая строка
     for (let i = btIdx + 1; i < lines.length; i++) {
       const cand = lines[i];
       if (/^https?:\/\//i.test(cand)) continue;
+      if (isStopWord(cand)) continue;
       if (discordNewRe.test(cand) || discordOldRe.test(cand)) return cand;
     }
     return null;
   }
 
-  // ✅ нет BattleTag: ищем discord-ник без #
+  // Нет BattleTag -> берём только "новый" discord без #
   for (const cand of lines) {
     if (/^https?:\/\//i.test(cand)) continue;
-    if (discordNewRe.test(cand)) return cand; // без # — точно не battletag
+    if (isStopWord(cand)) continue;
+    if (discordNewRe.test(cand)) return cand;
   }
 
-  // (если остался только один "name#1234" — не берём, чтобы не спутать с BattleTag)
   return null;
 }
 
@@ -325,11 +344,9 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
 
-      // ждём, чтобы успели дорисоваться блоки
       try {
         await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 6000 });
       } catch (_) {}
-      // ✅ дополнительно ждём Contact Info (если он лениво догружается)
       try {
         await page.waitForSelector('text=/Contact\\s+Info/i', { timeout: 4000 });
       } catch (_) {}
