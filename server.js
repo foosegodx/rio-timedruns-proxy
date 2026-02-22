@@ -5,11 +5,11 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ✅ увеличили лимит тела запроса, чтобы спокойно принимать 1500 ссылок
+// ✅ чтобы спокойно принимать 1500 ссылок
 app.use(express.json({ limit: "5mb" }));
 
-// ✅ версия кэша
-const CACHE_VER = "v12";
+// ✅ bump версии кэша (чтобы обновились discord/warband)
+const CACHE_VER = "v14";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -277,7 +277,122 @@ function parseTimedRunsAll(text) {
 }
 
 /**
- * ✅ Discord parser: исключает Twitch и другие платформы.
+ * ✅ DOM-версия: достаёт Discord строго из строки с иконкой Discord в Contact Info.
+ * Возвращает:
+ * - "name#1234" (старый формат) или
+ * - "name" (новый формат), если именно в discord-строке.
+ */
+async function extractDiscordFromDom(page) {
+  return await page
+    .evaluate(() => {
+      const norm = (s) =>
+        String(s || "")
+          .replace(/\u00a0/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+
+      const low = (s) => norm(s).toLowerCase();
+
+      const oldRe = /^[\p{L}\p{N}_.-]{2,32}#\d{4}$/u;
+      const newRe = /^[\p{L}\p{N}_.-]{2,32}$/u;
+
+      const bad = new Set([
+        "contact info",
+        "discord",
+        "loadout",
+        "twitch",
+        "twitter",
+        "youtube",
+        "kick",
+        "tiktok",
+        "instagram",
+        "facebook",
+      ]);
+
+      // находим корень Contact Info
+      const all = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"));
+      const head = all.find((el) => /contact info/i.test(el.textContent || ""));
+      const root = (head && (head.closest("section,aside,div") || head.parentElement)) || document.body;
+
+      // ищем элементы, которые с большой вероятностью являются иконкой Discord
+      const iconSelectors = [
+        'svg[data-icon="discord"]',
+        '[data-icon="discord"]',
+        'i[class*="discord"]',
+        'svg[aria-label*="discord" i]',
+        'img[alt*="discord" i]',
+        'a[href*="discord" i]',
+        '[data-testid*="discord" i]',
+        '[title*="discord" i]',
+        '[aria-label*="discord" i]',
+      ].join(",");
+
+      // если на странице нет явных атрибутов, пробуем найти строку по HTML-сигнатуре
+      const icons = Array.from(root.querySelectorAll(iconSelectors));
+
+      const candidateRows = [];
+
+      for (const ic of icons) {
+        const row = ic.closest("a,li,div,button,span") || ic.parentElement || ic;
+        if (row) candidateRows.push(row);
+      }
+
+      // fallback: иногда иконки не размечены — тогда ищем любые "строки" в contact info,
+      // где в innerHTML встречается слово discord.
+      if (!candidateRows.length) {
+        const rows = Array.from(root.querySelectorAll("a,li,div,button"))
+          .filter((el) => (el.innerText || "").trim().length > 0)
+          .slice(0, 400);
+
+        for (const r of rows) {
+          const html = (r.innerHTML || "").toLowerCase();
+          if (html.includes("discord")) candidateRows.push(r);
+        }
+      }
+
+      const uniq = [];
+      const seen = new Set();
+      for (const r of candidateRows) {
+        const key = r && r.outerHTML ? r.outerHTML.slice(0, 200) : String(r);
+        if (!seen.has(key)) {
+          seen.add(key);
+          uniq.push(r);
+        }
+      }
+
+      for (const row of uniq) {
+        let txt = norm(row.innerText || row.textContent || "");
+        if (!txt) continue;
+
+        const lines = txt
+          .split("\n")
+          .map((x) => norm(x))
+          .filter(Boolean)
+          .filter((x) => !bad.has(low(x)));
+
+        // выкидываем URL и платформенные слова
+        const cleaned = lines.filter(
+          (x) => !/^https?:\/\//i.test(x) && !bad.has(low(x))
+        );
+
+        // сначала строго старый формат
+        const hitOld = cleaned.find((x) => oldRe.test(x));
+        if (hitOld) return hitOld;
+
+        // затем новый формат, но только если он действительно строка контакта (а не "label")
+        // и не выглядит как название платформы
+        const hitNew = cleaned.find((x) => newRe.test(x) && x.length >= 3 && !bad.has(low(x)));
+        if (hitNew) return hitNew;
+      }
+
+      return null;
+    })
+    .catch(() => null);
+}
+
+/**
+ * ✅ Fallback по тексту (безопасный):
+ * берём ТОЛЬКО "name#1234". Новый формат без # не берём, чтобы не ловить Twitch.
  */
 function parseDiscordFromText(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
@@ -285,37 +400,23 @@ function parseDiscordFromText(text) {
   if (idx === -1) return null;
 
   let slice = t.slice(idx, idx + 2600);
-
-  const cut = slice.search(
-    /\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs|top runs)\b/i
-  );
+  const cut = slice.search(/\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs|top runs)\b/i);
   if (cut > 0) slice = slice.slice(0, cut);
 
   const lines = slice
     .split("\n")
     .map((s) => s.trim())
-    .filter((s) => s && s.toLowerCase() !== "contact info");
+    .filter(Boolean);
 
-  const btRe = /#\d{4}\b/;
   const discordOldRe = /^[\p{L}\p{N}_.-]{2,32}#\d{4}$/u;
-  const discordNewRe = /^[\p{L}\p{N}_.-]{2,32}$/u;
 
-  // слова/платформы которые нельзя возвращать как "дискорд"
   const badWords = new Set([
+    "contact info",
     "loadout",
     "gear",
     "talents",
-    "profile",
-    "contact",
-    "info",
-    "external",
-    "links",
-    "recent",
-    "runs",
-    "mythic+",
-    "mythic",
-    "raid",
-    "progression",
+    "external links",
+    "recent runs",
     "twitch",
     "twitter",
     "youtube",
@@ -327,40 +428,17 @@ function parseDiscordFromText(text) {
 
   const isBad = (s) => badWords.has(String(s || "").toLowerCase());
 
-  // 1) если нашли battletag — дискорд часто следующей строкой,
-  // но если предыдущая строка = twitch/twitter/... — пропускаем
-  const btIdx = lines.findIndex((l) => btRe.test(l));
-  if (btIdx !== -1) {
-    for (let i = btIdx + 1; i < lines.length; i++) {
-      const cand = lines[i];
-      if (!cand) continue;
-      if (isBad(cand)) continue;
-      if (/^https?:\/\//i.test(cand)) continue;
-
-      const prev = (lines[i - 1] || "").toLowerCase();
-      if (badWords.has(prev)) continue;
-
-      if (discordOldRe.test(cand) || discordNewRe.test(cand)) return cand;
-    }
-    return null;
-  }
-
-  // 2) fallback: ищем кандидата, но игнорируем строки рядом с twitch и т.п.
   for (let i = 0; i < lines.length; i++) {
     const cand = lines[i];
     if (!cand) continue;
-    if (isBad(cand)) continue;
     if (/^https?:\/\//i.test(cand)) continue;
+    if (isBad(cand)) continue;
 
     const prev = (lines[i - 1] || "").toLowerCase();
     const next = (lines[i + 1] || "").toLowerCase();
     if (badWords.has(prev) || badWords.has(next)) continue;
 
-    // надёжно берём только старый формат name#1234
     if (discordOldRe.test(cand)) return cand;
-
-    // новый дискорд без # — берём осторожно:
-    if (discordNewRe.test(cand) && cand.length >= 3) return cand;
   }
 
   return null;
@@ -585,14 +663,19 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
         await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 6000 });
       } catch (_) {}
       try {
-        await page.waitForSelector('text=/Contact\\s+Info/i', { timeout: 4000 });
+        await page.waitForSelector('text=/Contact\\s+Info/i', { timeout: 5000 });
       } catch (_) {}
+
+      // ✅ Discord сначала из DOM (по иконке Discord)
+      const domDiscord = await extractDiscordFromDom(page);
 
       const bodyText = await page.evaluate(() => document.body?.innerText || "");
       const parsed = parseTimedRunsAll(bodyText);
 
       if (parsed) {
-        const discord = parseDiscordFromText(bodyText);
+        // ✅ fallback по тексту только если DOM не нашёл
+        const discord = domDiscord || parseDiscordFromText(bodyText);
+
         const out = { ...parsed, regionUsed: region, discord: discord || null };
         setC(ck, out);
         return out;
