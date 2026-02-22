@@ -8,8 +8,8 @@ const PORT = process.env.PORT || 3000;
 // ✅ увеличили лимит тела запроса, чтобы спокойно принимать 1500 ссылок
 app.use(express.json({ limit: "5mb" }));
 
-// ✅ bump версии кэша (можно оставить v10, но пусть будет v11 чтобы не мешали старые кэши)
-const CACHE_VER = "v11";
+// ✅ версия кэша
+const CACHE_VER = "v12";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -276,14 +276,19 @@ function parseTimedRunsAll(text) {
   return { total, by };
 }
 
-// --- Discord from Contact Info (без Loadout) ---
+/**
+ * ✅ Discord parser: исключает Twitch и другие платформы.
+ */
 function parseDiscordFromText(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const idx = t.toLowerCase().indexOf("contact info");
   if (idx === -1) return null;
 
-  let slice = t.slice(idx, idx + 2200);
-  const cut = slice.search(/\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs)\b/i);
+  let slice = t.slice(idx, idx + 2600);
+
+  const cut = slice.search(
+    /\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs|top runs)\b/i
+  );
   if (cut > 0) slice = slice.slice(0, cut);
 
   const lines = slice
@@ -292,10 +297,11 @@ function parseDiscordFromText(text) {
     .filter((s) => s && s.toLowerCase() !== "contact info");
 
   const btRe = /#\d{4}\b/;
-  const discordNewRe = /^[\p{L}\p{N}_.-]{2,32}$/u;
   const discordOldRe = /^[\p{L}\p{N}_.-]{2,32}#\d{4}$/u;
+  const discordNewRe = /^[\p{L}\p{N}_.-]{2,32}$/u;
 
-  const stop = new Set([
+  // слова/платформы которые нельзя возвращать как "дискорд"
+  const badWords = new Set([
     "loadout",
     "gear",
     "talents",
@@ -310,25 +316,51 @@ function parseDiscordFromText(text) {
     "mythic",
     "raid",
     "progression",
+    "twitch",
+    "twitter",
+    "youtube",
+    "kick",
+    "tiktok",
+    "instagram",
+    "facebook",
   ]);
-  const isStopWord = (s) => stop.has(String(s || "").toLowerCase());
 
+  const isBad = (s) => badWords.has(String(s || "").toLowerCase());
+
+  // 1) если нашли battletag — дискорд часто следующей строкой,
+  // но если предыдущая строка = twitch/twitter/... — пропускаем
   const btIdx = lines.findIndex((l) => btRe.test(l));
-
   if (btIdx !== -1) {
     for (let i = btIdx + 1; i < lines.length; i++) {
       const cand = lines[i];
+      if (!cand) continue;
+      if (isBad(cand)) continue;
       if (/^https?:\/\//i.test(cand)) continue;
-      if (isStopWord(cand)) continue;
-      if (discordNewRe.test(cand) || discordOldRe.test(cand)) return cand;
+
+      const prev = (lines[i - 1] || "").toLowerCase();
+      if (badWords.has(prev)) continue;
+
+      if (discordOldRe.test(cand) || discordNewRe.test(cand)) return cand;
     }
     return null;
   }
 
-  for (const cand of lines) {
+  // 2) fallback: ищем кандидата, но игнорируем строки рядом с twitch и т.п.
+  for (let i = 0; i < lines.length; i++) {
+    const cand = lines[i];
+    if (!cand) continue;
+    if (isBad(cand)) continue;
     if (/^https?:\/\//i.test(cand)) continue;
-    if (isStopWord(cand)) continue;
-    if (discordNewRe.test(cand)) return cand;
+
+    const prev = (lines[i - 1] || "").toLowerCase();
+    const next = (lines[i + 1] || "").toLowerCase();
+    if (badWords.has(prev) || badWords.has(next)) continue;
+
+    // надёжно берём только старый формат name#1234
+    if (discordOldRe.test(cand)) return cand;
+
+    // новый дискорд без # — берём осторожно:
+    if (discordNewRe.test(cand) && cand.length >= 3) return cand;
   }
 
   return null;
