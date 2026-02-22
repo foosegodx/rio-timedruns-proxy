@@ -5,10 +5,11 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json({ limit: "1mb" }));
+// ✅ увеличили лимит тела запроса, чтобы спокойно принимать 1500 ссылок
+app.use(express.json({ limit: "5mb" }));
 
-// ✅ bump версии кэша (чтобы гарантированно пересчитать warband)
-const CACHE_VER = "v10";
+// ✅ bump версии кэша (можно оставить v10, но пусть будет v11 чтобы не мешали старые кэши)
+const CACHE_VER = "v11";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -33,6 +34,9 @@ const partialAttempts = new Map(); // runUrl -> attempts
 
 // warband попытка (чтобы не зависать)
 const WAR_BAND_TIMEOUT_MS = 30_000;
+
+// ✅ лимит количества URL в одном батче
+const MAX_URLS = 1500;
 
 const runKey = (u) => `run:${CACHE_VER}:${u}`;
 const ttKey = (regionHint, realm, name) =>
@@ -434,7 +438,6 @@ async function findWarbandUrlFromPage(page) {
 }
 
 async function detectHasWarband(page) {
-  // Ищем "warband" НЕ только в тексте, но и в aria/title/href/data-*
   return await page
     .evaluate(() => {
       const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
@@ -482,23 +485,20 @@ async function fetchWarbandUrl(context, region, realm, name) {
 
   try {
     await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
-    await page.waitForTimeout(800); // дать JS “подышать”
+    await page.waitForTimeout(800);
 
-    // ✅ ждём появления warband в интерфейсе
     const hasWar = await waitForWarbandEvidence(page, 12_000, 400);
     if (!hasWar) {
       setC(ck, null);
       return null;
     }
 
-    // 1) пробуем добыть реальный URL
     let url = await findWarbandUrlFromPage(page);
     if (url) {
       setC(ck, url);
       return url;
     }
 
-    // 2) кликаем найденный элемент warband (если есть) и пробуем снова
     await page
       .locator(
         'a:has-text("Warband"), button:has-text("Warband"), [role="tab"]:has-text("Warband"), [aria-label*="warband" i], [title*="warband" i]'
@@ -514,7 +514,6 @@ async function fetchWarbandUrl(context, region, realm, name) {
       return url;
     }
 
-    // 3) Warband есть, но URL нигде не светится (SPA вкладка) — отдаём fallback
     const fallback = profileUrl + "?tab=warband";
     setC(ck, fallback);
     return fallback;
@@ -613,7 +612,6 @@ async function lowestFromRun(context, runUrl) {
     best.p.realm
   )}/${encodeURIComponent(best.p.name)}`;
 
-  // ✅ warband только для выбранного lowest
   let warband_url = null;
   try {
     warband_url = await withTimeout(
@@ -748,7 +746,7 @@ setInterval(() => {
    Batch endpoints
    ======================= */
 function processBatchFast(urls) {
-  const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
+  const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, MAX_URLS);
 
   const results = new Array(clean.length);
   const missing = [];
@@ -785,7 +783,7 @@ function processBatchFast(urls) {
 }
 
 async function processBatchFull(urls) {
-  const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, 300);
+  const clean = urls.map((u) => (u ? String(u).trim() : "")).slice(0, MAX_URLS);
   const context = await getContext();
 
   const out = await mapLimit(clean, 2, async (u) => {
@@ -803,12 +801,13 @@ async function processBatchFull(urls) {
 /* =======================
    Routes
    ======================= */
-app.get("/health", (_, res) => res.json({ ok: true, ver: CACHE_VER }));
+app.get("/health", (_, res) => res.json({ ok: true, ver: CACHE_VER, max: MAX_URLS }));
 
 app.get("/debug", (_, res) => {
   res.json({
     ok: true,
     ver: CACHE_VER,
+    max: MAX_URLS,
     cacheSize: cache.size,
     queueLen: runQueue.length,
     queued: queued.size,
