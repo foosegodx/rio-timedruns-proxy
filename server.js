@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import fetch from "node-fetch";
 import { chromium } from "playwright";
@@ -9,7 +10,8 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: "5mb" }));
 
 // ✅ bump версии кэша (чтобы обновились discord/warband)
-const CACHE_VER = "v14";
+// (можешь оставить v14, но при изменениях удобнее bump)
+const CACHE_VER = "v15";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -371,16 +373,13 @@ async function extractDiscordFromDom(page) {
           .filter((x) => !bad.has(low(x)));
 
         // выкидываем URL и платформенные слова
-        const cleaned = lines.filter(
-          (x) => !/^https?:\/\//i.test(x) && !bad.has(low(x))
-        );
+        const cleaned = lines.filter((x) => !/^https?:\/\//i.test(x) && !bad.has(low(x)));
 
         // сначала строго старый формат
         const hitOld = cleaned.find((x) => oldRe.test(x));
         if (hitOld) return hitOld;
 
         // затем новый формат, но только если он действительно строка контакта (а не "label")
-        // и не выглядит как название платформы
         const hitNew = cleaned.find((x) => newRe.test(x) && x.length >= 3 && !bad.has(low(x)));
         if (hitNew) return hitNew;
       }
@@ -400,7 +399,9 @@ function parseDiscordFromText(text) {
   if (idx === -1) return null;
 
   let slice = t.slice(idx, idx + 2600);
-  const cut = slice.search(/\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs|top runs)\b/i);
+  const cut = slice.search(
+    /\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs|top runs)\b/i
+  );
   if (cut > 0) slice = slice.slice(0, cut);
 
   const lines = slice
@@ -445,7 +446,6 @@ function parseDiscordFromText(text) {
 }
 
 // ----- WAR BAND helpers -----
-
 async function findWarbandUrlFromPage(page) {
   const href = await page
     .evaluate(() => {
@@ -462,7 +462,9 @@ async function findWarbandUrlFromPage(page) {
       if (a1) return abs(a1.getAttribute("href"));
 
       const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
-      const els = Array.from(document.querySelectorAll("a,button,[role='tab'],[role='button'],[tabindex]"));
+      const els = Array.from(
+        document.querySelectorAll("a,button,[role='tab'],[role='button'],[tabindex]")
+      );
       const hit = els.find((el) => {
         const t = norm(el.textContent);
         const al = norm(el.getAttribute?.("aria-label"));
@@ -552,7 +554,9 @@ async function detectHasWarband(page) {
     .evaluate(() => {
       const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
       const els = Array.from(
-        document.querySelectorAll("a,button,[role='tab'],[role='button'],[tabindex],[aria-label],[title]")
+        document.querySelectorAll(
+          "a,button,[role='tab'],[role='button'],[tabindex],[aria-label],[title]"
+        )
       );
 
       return els.some((el) => {
@@ -913,6 +917,20 @@ async function processBatchFull(urls) {
   return out;
 }
 
+// ✅ компактный ответ для Sheets (ускоряет JSON.parse/запись в Apps Script)
+function compactForSheet(r) {
+  if (!r) return { ok: false, error: "No data", partial: true };
+  if (!r.ok) return { ok: false, error: r.error || "ERR", partial: !!r.partial };
+  return {
+    ok: true,
+    profile_url: r.profile_url || "",
+    lowest: r.lowest || "",
+    partial: !!r.partial,
+    discord: r.discord || "",
+    warband_url: r.warband_url || "",
+  };
+}
+
 /* =======================
    Routes
    ======================= */
@@ -969,16 +987,20 @@ app.get("/lowest-from-runs-get", async (req, res) => {
   }
 });
 
+// ✅ основной endpoint для Sheets
 app.post("/lowest-from-runs", async (req, res) => {
   try {
     const full = String(req.query.full || "") === "1";
+    const compact = String(req.query.compact || "") !== "0"; // default ON
     const urls = Array.isArray(req.body) ? req.body : req.body?.urls;
 
     if (!Array.isArray(urls)) {
       return res.status(400).json({ ok: false, error: "body must be array or { urls: array }" });
     }
 
-    const results = full ? await processBatchFull(urls) : processBatchFast(urls);
+    const resultsRaw = full ? await processBatchFull(urls) : processBatchFast(urls);
+    const results = (!full && compact) ? resultsRaw.map(compactForSheet) : resultsRaw;
+
     return res.json({ ok: true, results });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e.message || e) });
