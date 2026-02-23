@@ -9,8 +9,7 @@ const PORT = process.env.PORT || 3000;
 // ✅ чтобы спокойно принимать 1500 ссылок
 app.use(express.json({ limit: "5mb" }));
 
-// ✅ bump версии кэша (чтобы обновились discord/warband)
-// (можешь оставить v14, но при изменениях удобнее bump)
+// ✅ bump версии кэша (чтобы сбросить кеши при изменениях)
 const CACHE_VER = "v15";
 
 const cache = new Map();
@@ -280,9 +279,6 @@ function parseTimedRunsAll(text) {
 
 /**
  * ✅ DOM-версия: достаёт Discord строго из строки с иконкой Discord в Contact Info.
- * Возвращает:
- * - "name#1234" (старый формат) или
- * - "name" (новый формат), если именно в discord-строке.
  */
 async function extractDiscordFromDom(page) {
   return await page
@@ -311,12 +307,10 @@ async function extractDiscordFromDom(page) {
         "facebook",
       ]);
 
-      // находим корень Contact Info
       const all = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"));
       const head = all.find((el) => /contact info/i.test(el.textContent || ""));
       const root = (head && (head.closest("section,aside,div") || head.parentElement)) || document.body;
 
-      // ищем элементы, которые с большой вероятностью являются иконкой Discord
       const iconSelectors = [
         'svg[data-icon="discord"]',
         '[data-icon="discord"]',
@@ -329,18 +323,14 @@ async function extractDiscordFromDom(page) {
         '[aria-label*="discord" i]',
       ].join(",");
 
-      // если на странице нет явных атрибутов, пробуем найти строку по HTML-сигнатуре
       const icons = Array.from(root.querySelectorAll(iconSelectors));
 
       const candidateRows = [];
-
       for (const ic of icons) {
         const row = ic.closest("a,li,div,button,span") || ic.parentElement || ic;
         if (row) candidateRows.push(row);
       }
 
-      // fallback: иногда иконки не размечены — тогда ищем любые "строки" в contact info,
-      // где в innerHTML встречается слово discord.
       if (!candidateRows.length) {
         const rows = Array.from(root.querySelectorAll("a,li,div,button"))
           .filter((el) => (el.innerText || "").trim().length > 0)
@@ -372,14 +362,11 @@ async function extractDiscordFromDom(page) {
           .filter(Boolean)
           .filter((x) => !bad.has(low(x)));
 
-        // выкидываем URL и платформенные слова
         const cleaned = lines.filter((x) => !/^https?:\/\//i.test(x) && !bad.has(low(x)));
 
-        // сначала строго старый формат
         const hitOld = cleaned.find((x) => oldRe.test(x));
         if (hitOld) return hitOld;
 
-        // затем новый формат, но только если он действительно строка контакта (а не "label")
         const hitNew = cleaned.find((x) => newRe.test(x) && x.length >= 3 && !bad.has(low(x)));
         if (hitNew) return hitNew;
       }
@@ -390,8 +377,7 @@ async function extractDiscordFromDom(page) {
 }
 
 /**
- * ✅ Fallback по тексту (безопасный):
- * берём ТОЛЬКО "name#1234". Новый формат без # не берём, чтобы не ловить Twitch.
+ * ✅ Fallback по тексту (безопасный): берём ТОЛЬКО "name#1234".
  */
 function parseDiscordFromText(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
@@ -399,9 +385,7 @@ function parseDiscordFromText(text) {
   if (idx === -1) return null;
 
   let slice = t.slice(idx, idx + 2600);
-  const cut = slice.search(
-    /\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs|top runs)\b/i
-  );
+  const cut = slice.search(/\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs|top runs)\b/i);
   if (cut > 0) slice = slice.slice(0, cut);
 
   const lines = slice
@@ -462,9 +446,7 @@ async function findWarbandUrlFromPage(page) {
       if (a1) return abs(a1.getAttribute("href"));
 
       const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
-      const els = Array.from(
-        document.querySelectorAll("a,button,[role='tab'],[role='button'],[tabindex]")
-      );
+      const els = Array.from(document.querySelectorAll("a,button,[role='tab'],[role='button'],[tabindex]"));
       const hit = els.find((el) => {
         const t = norm(el.textContent);
         const al = norm(el.getAttribute?.("aria-label"));
@@ -554,9 +536,7 @@ async function detectHasWarband(page) {
     .evaluate(() => {
       const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
       const els = Array.from(
-        document.querySelectorAll(
-          "a,button,[role='tab'],[role='button'],[tabindex],[aria-label],[title]"
-        )
+        document.querySelectorAll("a,button,[role='tab'],[role='button'],[tabindex],[aria-label],[title]")
       );
 
       return els.some((el) => {
@@ -670,16 +650,13 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
         await page.waitForSelector('text=/Contact\\s+Info/i', { timeout: 5000 });
       } catch (_) {}
 
-      // ✅ Discord сначала из DOM (по иконке Discord)
       const domDiscord = await extractDiscordFromDom(page);
 
       const bodyText = await page.evaluate(() => document.body?.innerText || "");
       const parsed = parseTimedRunsAll(bodyText);
 
       if (parsed) {
-        // ✅ fallback по тексту только если DOM не нашёл
         const discord = domDiscord || parseDiscordFromText(bodyText);
-
         const out = { ...parsed, regionUsed: region, discord: discord || null };
         setC(ck, out);
         return out;
@@ -705,19 +682,27 @@ async function lowestFromRun(context, runUrl) {
 
   const deadline = Date.now() + (RUN_TIMEOUT_MS - 3000);
   let best = null;
-  let done = 0;
+
+  // ✅ ВАЖНО: считаем отдельно attempted и found
+  let attempted = 0; // сколько игроков мы реально попробовали обработать
+  let found = 0;     // сколько игроков успешно распарсились (stat != null)
 
   for (const p of roster) {
     if (Date.now() > deadline) break;
 
     const stat = await fetchTimedTotal(context, p.realm, p.name, p.region);
-    done++;
+    attempted++;
 
     if (!stat) continue;
+    found++;
+
     if (!best || stat.total < best.stat.total) best = { p, stat };
   }
 
-  const partial = done < roster.length;
+  // ✅ partial = true, если:
+  // - не успели пройти всех (attempted < roster.length), ИЛИ
+  // - кого-то не распарсили (found < roster.length)
+  const partial = attempted < roster.length || found < roster.length;
 
   if (!best) {
     const outFail = { ok: false, error: "no timed totals found", partial: true };
