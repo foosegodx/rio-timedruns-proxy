@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: "5mb" }));
 
 // ✅ bump версии кэша (сброс кешей при изменениях)
-const CACHE_VER = "v23";
+const CACHE_VER = "v24";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -23,14 +23,19 @@ const UA =
 const RUN_TIMEOUT_MS = 140_000;
 const INFLIGHT_STALE_MS = 3 * 70_000;
 
+// скорость
 const WORKER_BATCH = 6;
 const WORKER_PARALLEL = 2;
 
+// partial — попробуем дорефайнить позже
 const PARTIAL_RETRY_MAX = 2;
 const PARTIAL_RETRY_DELAY_MS = 30_000;
 const partialAttempts = new Map(); // runUrl -> attempts (server-side)
 
+// warband попытка (чтобы не зависать)
 const WAR_BAND_TIMEOUT_MS = 30_000;
+
+// ✅ лимит количества URL в одном батче
 const MAX_URLS = 1500;
 
 // =====================
@@ -38,6 +43,7 @@ const MAX_URLS = 1500;
 // =====================
 const runKey = (u) => `run:${CACHE_VER}:${u}`;
 
+// ✅ season-aware timed-total cache key
 const ttKey = (season, regionHint, realm, name) =>
   `tt:${CACHE_VER}:${String(season || "")}:${(regionHint || "").toLowerCase()}:${String(realm)}:${String(
     name
@@ -91,6 +97,7 @@ function normalizeRegion(regionRaw) {
   return "";
 }
 
+// base64 websafe (Apps Script) -> utf8 (для legacy GET)
 function decodeBase64WebSafeToUtf8(enc) {
   const s = String(enc || "");
   let b64 = s.replace(/-/g, "+").replace(/_/g, "/");
@@ -265,7 +272,7 @@ async function fetchRunRoster(runUrl) {
 }
 
 // =====================
-// Timed Runs parsing
+// Timed Runs parsing (fallback text)
 // =====================
 function parseTimedRunsAll(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
@@ -294,6 +301,7 @@ function parseTimedRunsAll(text) {
   return { total, by };
 }
 
+// ✅ суммирование только диапазона 5..20 (включительно)
 function sumTimedRange(by, minLvl = 5, maxLvl = 20) {
   let total = 0;
   const out = {};
@@ -310,11 +318,12 @@ function sumTimedRange(by, minLvl = 5, maxLvl = 20) {
 }
 
 /**
- * ✅ DOM-версия timed runs (v23):
- * Пары "уровень -> число" собираем по геометрии:
- * - находим label элементы "X+ Keystone Timed Runs"
- * - находим элементы с чистыми цифрами рядом
- * - сопоставляем по минимальной разнице по Y (строка) и обычно справа (dx>=0)
+ * ✅ DOM-версия timed runs (v24):
+ * - находим "плитки" (card), где "Keystone Timed Runs" встречается ровно 1 раз
+ * - внутри card берём:
+ *    level = \d+ + (например 20+)
+ *    count = число НЕ перед '+'
+ * Это устраняет “сдвиги” типа 20+=86, 15+=180.
  */
 async function extractTimedRunsFromDom(page) {
   return await page
@@ -325,12 +334,10 @@ async function extractTimedRunsFromDom(page) {
           .replace(/\s+/g, " ")
           .trim();
 
-      const getLevel = (s) => {
-        const m = norm(s).match(/(\d{1,3})\s*[+＋]/);
-        return m ? `${m[1]}+` : null;
+      const countOcc = (txt, re) => {
+        const m = String(txt).match(re);
+        return m ? m.length : 0;
       };
-
-      const isDigits = (s) => /^\d[\d,]*$/.test(norm(s));
 
       // ограничиваем область Mythic+ секцией
       const all = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"));
@@ -339,76 +346,67 @@ async function extractTimedRunsFromDom(page) {
         (scoreHead && (scoreHead.closest("section,article,aside,div") || scoreHead.parentElement)) ||
         document.body;
 
-      // label-элементы "10+ Keystone Timed Runs"
-      const labels = Array.from(root.querySelectorAll("*"))
-        .filter((el) => {
-          const t = norm(el.textContent || "");
-          return /keystone timed runs/i.test(t) && /(\d{1,3})\s*[+＋]/.test(t);
-        })
-        .slice(0, 200);
+      // ищем элементы, где есть "Keystone Timed Runs"
+      const seeds = Array.from(root.querySelectorAll("*"))
+        .filter((el) => /keystone\s+timed\s+runs/i.test(el.textContent || ""))
+        .slice(0, 800);
 
-      if (!labels.length) return null;
+      const tiles = [];
+      const seen = new Set();
 
-      // кандидаты-цифры (в этой же области)
-      const nums = Array.from(root.querySelectorAll("*"))
-        .filter((el) => {
-          // чтобы не брать контейнеры, берём листья
-          if (el.children && el.children.length > 0) return false;
-          const t = norm(el.textContent || "");
-          return t && isDigits(t);
-        })
-        .slice(0, 600)
-        .map((el) => {
-          const r = el.getBoundingClientRect();
-          const t = norm(el.textContent || "");
-          const v = Number(t.replace(/,/g, ""));
-          return {
-            el,
-            v,
-            cx: r.left + r.width / 2,
-            cy: r.top + r.height / 2,
-            w: r.width,
-            h: r.height,
-          };
-        })
-        .filter((x) => Number.isFinite(x.v) && x.v >= 0);
+      // поднимаемся вверх от seed и ищем "tile" с 1х 'Keystone Timed Runs'
+      for (const s of seeds) {
+        let cur = s;
+        for (let i = 0; i < 10; i++) {
+          if (!cur) break;
 
-      if (!nums.length) return null;
+          const txt = norm(cur.innerText || cur.textContent || "");
+          if (txt) {
+            const occ = countOcc(txt.toLowerCase(), /keystone timed runs/g);
+            const hasLevel = /(\d{1,3})\s*[+＋]/.test(txt);
+            const hasCount = /\b(\d[\d,]*)\b(?!\s*[+＋])/g.test(txt);
+
+            // ограничение по размеру текста: чтобы не схватить большой контейнер на 3 плитки
+            if (occ === 1 && hasLevel && hasCount && txt.length <= 160) {
+              const key = cur.dataset?.reactid || cur.id || cur.outerHTML?.slice(0, 80) || String(cur);
+              if (!seen.has(key)) {
+                seen.add(key);
+                tiles.push(cur);
+              }
+              break;
+            }
+          }
+
+          cur = cur.parentElement;
+        }
+      }
 
       const by = {};
 
-      for (const lab of labels) {
-        const lvl = getLevel(lab.textContent || "");
-        if (!lvl) continue;
+      for (const tile of tiles) {
+        const txt = norm(tile.innerText || tile.textContent || "");
+        if (!txt) continue;
 
-        const r = lab.getBoundingClientRect();
-        const lcx = r.left + r.width / 2;
-        const lcy = r.top + r.height / 2;
+        const mLvl = txt.match(/(\d{1,3})\s*[+＋]/);
+        if (!mLvl) continue;
+        const lvl = `${mLvl[1]}+`;
 
-        // ищем число на той же строке (по Y), предпочтительно справа
-        let best = null;
-
-        for (const n of nums) {
-          // игнорируем числа, которые являются частью самого label (если вдруг)
-          if (lab.contains(n.el)) continue;
-
-          const dy = Math.abs(n.cy - lcy);
-
-          // "строка" — обычно очень близко по Y; даём небольшой допуск
-          if (dy > Math.max(18, r.height * 0.9)) continue;
-
-          const dx = n.cx - lcx;
-          // предпочтительно справа, но если верстка поменялась, позволим и слева (с штрафом)
-          const dxPenalty = dx >= 0 ? 0 : Math.abs(dx) + 200;
-
-          const score = dy * 10 + dxPenalty;
-
-          if (!best || score < best.score) best = { v: n.v, score };
+        // числа, НЕ перед '+'
+        const nums = [];
+        const reNum = /\b(\d[\d,]*)\b(?!\s*[+＋])/g;
+        let m;
+        while ((m = reNum.exec(txt)) !== null) {
+          const n = Number(String(m[1]).replace(/,/g, ""));
+          if (Number.isFinite(n)) nums.push(n);
         }
+        if (!nums.length) continue;
 
-        if (!best) continue;
+        // в плитке обычно 1 число — count. если их несколько, берём max (надёжнее)
+        const count = Math.max(...nums);
 
-        by[lvl] = Math.max(by[lvl] || 0, best.v);
+        // если есть дубликаты уровня (вдруг), оставим MIN (чтобы не схватить "общий" блок)
+        if (by[lvl] === undefined) by[lvl] = count;
+        else by[lvl] = Math.min(by[lvl], count);
       }
 
       const keys = Object.keys(by);
@@ -421,7 +419,7 @@ async function extractTimedRunsFromDom(page) {
 }
 
 /**
- * ✅ Discord DOM extractor
+ * ✅ Discord DOM extractor (как было)
  */
 async function extractDiscordFromDom(page) {
   return await page
@@ -519,6 +517,9 @@ async function extractDiscordFromDom(page) {
     .catch(() => null);
 }
 
+/**
+ * ✅ Text fallback discord (как было)
+ */
 function parseDiscordFromText(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const idx = t.toLowerCase().indexOf("contact info");
@@ -569,9 +570,7 @@ function parseDiscordFromText(text) {
   return null;
 }
 
-// =====================
-// Warband helpers (как было)
-// =====================
+// ----- WAR BAND helpers -----
 async function findWarbandUrlFromPage(page) {
   const href = await page
     .evaluate(() => {
@@ -761,9 +760,10 @@ async function fetchWarbandUrl(context, region, realm, name) {
   }
 }
 
-// =====================
-// Timed total fetch (season-aware + DOM-first)
-// =====================
+/**
+ * ✅ Возвращает { total, by, regionUsed, discord } или null
+ * ✅ season-aware: открываем профиль с ?season=...
+ */
 async function fetchTimedTotal(context, realm, name, regionHint, season) {
   const ck = ttKey(season, regionHint, realm, name);
   const cached = getC(ck);
@@ -798,6 +798,7 @@ async function fetchTimedTotal(context, realm, name, regionHint, season) {
 
       const domDiscord = await extractDiscordFromDom(page);
 
+      // ✅ DOM timed runs (v24)
       const domTimed = await extractTimedRunsFromDom(page);
       if (domTimed) {
         const out = {
@@ -811,6 +812,7 @@ async function fetchTimedTotal(context, realm, name, regionHint, season) {
         return out;
       }
 
+      // fallback: текстовый парсер
       const bodyText = await page.evaluate(() => document.body?.innerText || "");
       const parsed = parseTimedRunsAll(bodyText);
 
@@ -831,9 +833,7 @@ async function fetchTimedTotal(context, realm, name, regionHint, season) {
   return null;
 }
 
-// =====================
-// Lowest for run (✅ выбираем по 5..20)
-// =====================
+// --- lowest for run (✅ выбираем по 5..20) ---
 async function lowestFromRun(context, runUrl) {
   const rk = runKey(runUrl);
   const cached = getC(rk);
@@ -843,8 +843,8 @@ async function lowestFromRun(context, runUrl) {
   const season = seasonFromRunUrl(runUrl);
 
   const deadline = Date.now() + (RUN_TIMEOUT_MS - 3000);
-
   let best = null; // {p, stat, t520}
+
   let attempted = 0;
   let found = 0;
 
@@ -871,7 +871,6 @@ async function lowestFromRun(context, runUrl) {
 
   const label = `${best.p.name}-${best.p.realm}`.toLowerCase();
   const regionForUrl = best.stat.regionUsed || best.p.region || "eu";
-
   const profile_url = `https://raider.io/characters/${regionForUrl}/${encodeURIComponent(
     best.p.realm
   )}/${encodeURIComponent(best.p.name)}${season ? `?season=${encodeURIComponent(season)}` : ""}`;
@@ -893,11 +892,17 @@ async function lowestFromRun(context, runUrl) {
     profile_url,
     discord: best.stat.discord || null,
     warband_url: warband_url || null,
+
+    // ✅ метрика выбора
     timed_total_5_20: best.t520,
+
+    // (для отладки) что распарсили
     timed_total: best.stat.total,
     timed_breakdown: best.stat.by,
+
     season: season || "",
     partial,
+    ver: CACHE_VER,
   };
 
   setC(rk, out, partial ? 20 * 60 * 1000 : TTL_MS);
@@ -1068,6 +1073,7 @@ async function processBatchFull(urls) {
   return out;
 }
 
+// ✅ компактный ответ для Sheets (ускоряет JSON.parse/запись в Apps Script)
 function compactForSheet(r) {
   if (!r) return { ok: false, error: "No data", partial: true };
   if (!r.ok) return { ok: false, error: r.error || "ERR", partial: !!r.partial };
@@ -1113,6 +1119,7 @@ app.get("/lowest-from-run", async (req, res) => {
   }
 });
 
+// helper: total 5..20 для конкретного чара + season
 app.get("/timed-total", async (req, res) => {
   const url = String(req.query.url || "").trim();
   if (!url) return res.status(400).json({ ok: false, error: "missing url" });
@@ -1130,12 +1137,13 @@ app.get("/timed-total", async (req, res) => {
     const context = await getContext();
     const stat = await fetchTimedTotal(context, realm, name, regionHint, season);
 
-    if (!stat) return res.json({ ok: false, error: "no timed totals found" });
+    if (!stat) return res.json({ ok: false, error: "no timed totals found", ver: CACHE_VER });
 
     const r = sumTimedRange(stat.by, 5, 20);
 
     return res.json({
       ok: true,
+      ver: CACHE_VER,
       profile_url: `https://raider.io/characters/${stat.regionUsed || regionHint}/${encodeURIComponent(
         realm
       )}/${encodeURIComponent(name)}${season ? `?season=${encodeURIComponent(season)}` : ""}`,
@@ -1147,7 +1155,7 @@ app.get("/timed-total", async (req, res) => {
       regionUsed: stat.regionUsed || regionHint,
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
+    return res.status(500).json({ ok: false, error: String(e.message || e), ver: CACHE_VER });
   }
 });
 
@@ -1175,6 +1183,7 @@ app.get("/lowest-from-runs-get", async (req, res) => {
   }
 });
 
+// ✅ основной endpoint для Sheets
 app.post("/lowest-from-runs", async (req, res) => {
   try {
     const full = String(req.query.full || "") === "1";
