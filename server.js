@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: "5mb" }));
 
 // ✅ bump версии кэша (сброс кешей при изменениях)
-const CACHE_VER = "v18";
+const CACHE_VER = "v19";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -33,12 +33,23 @@ const PARTIAL_RETRY_MAX = 2;
 const PARTIAL_RETRY_DELAY_MS = 30_000;
 const partialAttempts = new Map(); // runUrl -> attempts (server-side)
 
+// warband попытка (чтобы не зависать)
 const WAR_BAND_TIMEOUT_MS = 30_000;
+
+// ✅ лимит количества URL в одном батче
 const MAX_URLS = 1500;
 
+// =====================
+// Cache keys
+// =====================
 const runKey = (u) => `run:${CACHE_VER}:${u}`;
-const ttKey = (regionHint, realm, name) =>
-  `tt:${CACHE_VER}:${(regionHint || "").toLowerCase()}:${String(realm)}:${String(name)}`.toLowerCase();
+
+// ✅ season-aware timed-total cache key
+const ttKey = (season, regionHint, realm, name) =>
+  `tt:${CACHE_VER}:${String(season || "")}:${(regionHint || "").toLowerCase()}:${String(realm)}:${String(
+    name
+  )}`.toLowerCase();
+
 const wbKey = (region, realm, name) =>
   `wb:${CACHE_VER}:${region}:${String(realm)}:${String(name)}`.toLowerCase();
 
@@ -46,13 +57,13 @@ function now() {
   return Date.now();
 }
 
-// ✅ FIX: distinguish cache miss vs cached null
+// ✅ FIX: distinguish cache miss (undefined) vs cached null
 function getC(k) {
   const v = cache.get(k);
-  if (!v) return undefined; // miss
+  if (!v) return undefined;
   if (now() > v.exp) {
     cache.delete(k);
-    return undefined; // expired miss
+    return undefined;
   }
   return v.val; // may be null
 }
@@ -135,7 +146,17 @@ function withTimeout(promiseFactory, ms, label = "timeout") {
   });
 }
 
-// --- Playwright singleton ---
+// =====================
+// Season helpers
+// =====================
+function seasonFromRunUrl(runUrl) {
+  const m = String(runUrl).match(/\/mythic-plus-runs\/(season-[^/]+)\/\d+-/i);
+  return m ? m[1] : "";
+}
+
+// =====================
+// Playwright singleton
+// =====================
 let browserPromise = null;
 let contextPromise = null;
 let resetLock = null;
@@ -202,7 +223,9 @@ async function shutdown() {
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
-// --- Raider.IO run-details roster ---
+// =====================
+// Raider.IO run-details roster
+// =====================
 async function fetchRunRoster(runUrl) {
   const m = String(runUrl).match(/\/mythic-plus-runs\/(season-[^/]+)\/(\d+)-/i);
   if (!m) throw new Error("Bad URL");
@@ -249,7 +272,9 @@ async function fetchRunRoster(runUrl) {
   return roster;
 }
 
-// --- Timed Runs total ---
+// =====================
+// Timed Runs parsing
+// =====================
 function parseTimedRunsAll(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const by = {};
@@ -328,14 +353,14 @@ async function extractDiscordFromDom(page) {
 
       const iconSelectors = [
         'svg[data-icon="discord"]',
-        '[data-icon="discord"]',
-        'i[class*="discord"]',
-        'svg[aria-label*="discord" i]',
-        'img[alt*="discord" i]',
-        'a[href*="discord" i]',
-        '[data-testid*="discord" i]',
-        '[title*="discord" i]',
-        '[aria-label*="discord" i]',
+        "[data-icon='discord']",
+        "i[class*='discord']",
+        "svg[aria-label*='discord' i]",
+        "img[alt*='discord' i]",
+        "a[href*='discord' i]",
+        "[data-testid*='discord' i]",
+        "[title*='discord' i]",
+        "[aria-label*='discord' i]",
       ].join(",");
 
       const icons = Array.from(root.querySelectorAll(iconSelectors));
@@ -444,7 +469,9 @@ function parseDiscordFromText(text) {
   return null;
 }
 
-// ----- WAR BAND helpers -----
+// =====================
+// Warband helpers
+// =====================
 async function findWarbandUrlFromPage(page) {
   const href = await page
     .evaluate(() => {
@@ -634,11 +661,11 @@ async function fetchWarbandUrl(context, region, realm, name) {
   }
 }
 
-/**
- * ✅ Возвращает { total, by, regionUsed, discord } или null
- */
-async function fetchTimedTotal(context, realm, name, regionHint) {
-  const ck = ttKey(regionHint, realm, name);
+// =====================
+// Timed total fetch (season-aware)
+// =====================
+async function fetchTimedTotal(context, realm, name, regionHint, season) {
+  const ck = ttKey(season, regionHint, realm, name);
   const cached = getC(ck);
   if (cached !== undefined) return cached; // object|null
 
@@ -651,9 +678,10 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
     page.setDefaultTimeout(15000);
     page.setDefaultNavigationTimeout(15000);
 
-    const url = `https://raider.io/characters/${region}/${encodeURIComponent(realm)}/${encodeURIComponent(
+    const base = `https://raider.io/characters/${region}/${encodeURIComponent(realm)}/${encodeURIComponent(
       name
     )}`;
+    const url = season ? `${base}?season=${encodeURIComponent(season)}` : base;
 
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
@@ -672,7 +700,7 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
 
       if (parsed) {
         const discord = domDiscord || parseDiscordFromText(bodyText);
-        const out = { ...parsed, regionUsed: region, discord: discord || null };
+        const out = { ...parsed, regionUsed: region, discord: discord || null, seasonUsed: season || "" };
         setC(ck, out);
         return out;
       }
@@ -683,18 +711,21 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
     }
   }
 
-  // ✅ negative cache (null) works now
+  // ✅ negative cache
   setC(ck, null);
   return null;
 }
 
-// --- lowest for run ---
+// =====================
+// Lowest for run
+// =====================
 async function lowestFromRun(context, runUrl) {
   const rk = runKey(runUrl);
   const cached = getC(rk);
   if (cached !== undefined) return cached;
 
   const roster = await fetchRunRoster(runUrl);
+  const season = seasonFromRunUrl(runUrl);
 
   const deadline = Date.now() + (RUN_TIMEOUT_MS - 3000);
   let best = null;
@@ -705,7 +736,7 @@ async function lowestFromRun(context, runUrl) {
   for (const p of roster) {
     if (Date.now() > deadline) break;
 
-    const stat = await fetchTimedTotal(context, p.realm, p.name, p.region);
+    const stat = await fetchTimedTotal(context, p.realm, p.name, p.region, season);
     attempted++;
 
     if (!stat) continue;
@@ -726,7 +757,7 @@ async function lowestFromRun(context, runUrl) {
   const regionForUrl = best.stat.regionUsed || best.p.region || "eu";
   const profile_url = `https://raider.io/characters/${regionForUrl}/${encodeURIComponent(
     best.p.realm
-  )}/${encodeURIComponent(best.p.name)}`;
+  )}/${encodeURIComponent(best.p.name)}${season ? `?season=${encodeURIComponent(season)}` : ""}`;
 
   let warband_url = null;
   try {
@@ -747,6 +778,7 @@ async function lowestFromRun(context, runUrl) {
     warband_url: warband_url || null,
     timed_total: best.stat.total,
     timed_breakdown: best.stat.by,
+    season: season || "",
     partial,
   };
 
@@ -965,10 +997,14 @@ app.get("/lowest-from-run", async (req, res) => {
   }
 });
 
-// ✅ character helper: total только 5..20 (включительно)
+// ✅ character helper: total только 5..20 (включительно) + season param
+// usage:
+// /timed-total?url=https://raider.io/characters/eu/zenedar/Atrius&season=season-tww-3
 app.get("/timed-total", async (req, res) => {
   const url = String(req.query.url || "").trim();
   if (!url) return res.status(400).json({ ok: false, error: "missing url" });
+
+  const season = String(req.query.season || "").trim();
 
   const m = url.match(/raider\.io\/characters\/([^/]+)\/([^/]+)\/([^/?#]+)/i);
   if (!m) return res.status(400).json({ ok: false, error: "bad character url" });
@@ -979,7 +1015,7 @@ app.get("/timed-total", async (req, res) => {
 
   try {
     const context = await getContext();
-    const stat = await fetchTimedTotal(context, realm, name, regionHint);
+    const stat = await fetchTimedTotal(context, realm, name, regionHint, season);
 
     if (!stat) return res.json({ ok: false, error: "no timed totals found" });
 
@@ -989,7 +1025,8 @@ app.get("/timed-total", async (req, res) => {
       ok: true,
       profile_url: `https://raider.io/characters/${stat.regionUsed || regionHint}/${encodeURIComponent(
         realm
-      )}/${encodeURIComponent(name)}`,
+      )}/${encodeURIComponent(name)}${season ? `?season=${encodeURIComponent(season)}` : ""}`,
+      season: season || "",
       total_5_20: r.total,
       breakdown_5_20: r.by,
       total_all_levels: stat.total,
