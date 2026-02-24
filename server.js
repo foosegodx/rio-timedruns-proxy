@@ -9,9 +9,8 @@ const PORT = process.env.PORT || 3000;
 // ✅ чтобы спокойно принимать 1500 ссылок
 app.use(express.json({ limit: "5mb" }));
 
-// ✅ bump версии кэша (чтобы обновились discord/warband)
-// (можешь оставить v14, но при изменениях удобнее bump)
-const CACHE_VER = "v15";
+// ✅ bump версии кэша (сброс кешей при изменениях)
+const CACHE_VER = "v18";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -32,12 +31,9 @@ const WORKER_PARALLEL = 2;
 // partial — попробуем дорефайнить позже
 const PARTIAL_RETRY_MAX = 2;
 const PARTIAL_RETRY_DELAY_MS = 30_000;
-const partialAttempts = new Map(); // runUrl -> attempts
+const partialAttempts = new Map(); // runUrl -> attempts (server-side)
 
-// warband попытка (чтобы не зависать)
 const WAR_BAND_TIMEOUT_MS = 30_000;
-
-// ✅ лимит количества URL в одном батче
 const MAX_URLS = 1500;
 
 const runKey = (u) => `run:${CACHE_VER}:${u}`;
@@ -49,14 +45,16 @@ const wbKey = (region, realm, name) =>
 function now() {
   return Date.now();
 }
+
+// ✅ FIX: distinguish cache miss vs cached null
 function getC(k) {
   const v = cache.get(k);
-  if (!v) return null;
+  if (!v) return undefined;
   if (now() > v.exp) {
     cache.delete(k);
-    return null;
+    return undefined;
   }
-  return v.val;
+  return v.val; // may be null, object, etc.
 }
 function setC(k, val, ttlMs = TTL_MS) {
   cache.set(k, { val, exp: now() + ttlMs });
@@ -280,9 +278,6 @@ function parseTimedRunsAll(text) {
 
 /**
  * ✅ DOM-версия: достаёт Discord строго из строки с иконкой Discord в Contact Info.
- * Возвращает:
- * - "name#1234" (старый формат) или
- * - "name" (новый формат), если именно в discord-строке.
  */
 async function extractDiscordFromDom(page) {
   return await page
@@ -311,12 +306,10 @@ async function extractDiscordFromDom(page) {
         "facebook",
       ]);
 
-      // находим корень Contact Info
       const all = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"));
       const head = all.find((el) => /contact info/i.test(el.textContent || ""));
       const root = (head && (head.closest("section,aside,div") || head.parentElement)) || document.body;
 
-      // ищем элементы, которые с большой вероятностью являются иконкой Discord
       const iconSelectors = [
         'svg[data-icon="discord"]',
         '[data-icon="discord"]',
@@ -329,18 +322,14 @@ async function extractDiscordFromDom(page) {
         '[aria-label*="discord" i]',
       ].join(",");
 
-      // если на странице нет явных атрибутов, пробуем найти строку по HTML-сигнатуре
       const icons = Array.from(root.querySelectorAll(iconSelectors));
 
       const candidateRows = [];
-
       for (const ic of icons) {
         const row = ic.closest("a,li,div,button,span") || ic.parentElement || ic;
         if (row) candidateRows.push(row);
       }
 
-      // fallback: иногда иконки не размечены — тогда ищем любые "строки" в contact info,
-      // где в innerHTML встречается слово discord.
       if (!candidateRows.length) {
         const rows = Array.from(root.querySelectorAll("a,li,div,button"))
           .filter((el) => (el.innerText || "").trim().length > 0)
@@ -372,14 +361,11 @@ async function extractDiscordFromDom(page) {
           .filter(Boolean)
           .filter((x) => !bad.has(low(x)));
 
-        // выкидываем URL и платформенные слова
         const cleaned = lines.filter((x) => !/^https?:\/\//i.test(x) && !bad.has(low(x)));
 
-        // сначала строго старый формат
         const hitOld = cleaned.find((x) => oldRe.test(x));
         if (hitOld) return hitOld;
 
-        // затем новый формат, но только если он действительно строка контакта (а не "label")
         const hitNew = cleaned.find((x) => newRe.test(x) && x.length >= 3 && !bad.has(low(x)));
         if (hitNew) return hitNew;
       }
@@ -390,8 +376,7 @@ async function extractDiscordFromDom(page) {
 }
 
 /**
- * ✅ Fallback по тексту (безопасный):
- * берём ТОЛЬКО "name#1234". Новый формат без # не берём, чтобы не ловить Twitch.
+ * ✅ Fallback по тексту (безопасный): берём ТОЛЬКО "name#1234".
  */
 function parseDiscordFromText(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
@@ -399,9 +384,7 @@ function parseDiscordFromText(text) {
   if (idx === -1) return null;
 
   let slice = t.slice(idx, idx + 2600);
-  const cut = slice.search(
-    /\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs|top runs)\b/i
-  );
+  const cut = slice.search(/\n\s*(mythic\+|raid progression|gear|talents|external links|recent runs|top runs)\b/i);
   if (cut > 0) slice = slice.slice(0, cut);
 
   const lines = slice
@@ -462,9 +445,7 @@ async function findWarbandUrlFromPage(page) {
       if (a1) return abs(a1.getAttribute("href"));
 
       const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
-      const els = Array.from(
-        document.querySelectorAll("a,button,[role='tab'],[role='button'],[tabindex]")
-      );
+      const els = Array.from(document.querySelectorAll("a,button,[role='tab'],[role='button'],[tabindex]"));
       const hit = els.find((el) => {
         const t = norm(el.textContent);
         const al = norm(el.getAttribute?.("aria-label"));
@@ -554,9 +535,7 @@ async function detectHasWarband(page) {
     .evaluate(() => {
       const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
       const els = Array.from(
-        document.querySelectorAll(
-          "a,button,[role='tab'],[role='button'],[tabindex],[aria-label],[title]"
-        )
+        document.querySelectorAll("a,button,[role='tab'],[role='button'],[tabindex],[aria-label],[title]")
       );
 
       return els.some((el) => {
@@ -587,7 +566,7 @@ async function waitForWarbandEvidence(page, totalMs = 12_000, stepMs = 400) {
 async function fetchWarbandUrl(context, region, realm, name) {
   const ck = wbKey(region, realm, name);
   const cached = getC(ck);
-  if (cached !== null) return cached; // string|null
+  if (cached !== undefined) return cached; // string|null
 
   const profileUrl = `https://raider.io/characters/${region}/${encodeURIComponent(realm)}/${encodeURIComponent(
     name
@@ -645,7 +624,7 @@ async function fetchWarbandUrl(context, region, realm, name) {
 async function fetchTimedTotal(context, realm, name, regionHint) {
   const ck = ttKey(regionHint, realm, name);
   const cached = getC(ck);
-  if (cached !== null) return cached;
+  if (cached !== undefined) return cached; // object|null
 
   const tryRegions = [];
   if (regionHint && regions.includes(regionHint)) tryRegions.push(regionHint);
@@ -670,16 +649,13 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
         await page.waitForSelector('text=/Contact\\s+Info/i', { timeout: 5000 });
       } catch (_) {}
 
-      // ✅ Discord сначала из DOM (по иконке Discord)
       const domDiscord = await extractDiscordFromDom(page);
 
       const bodyText = await page.evaluate(() => document.body?.innerText || "");
       const parsed = parseTimedRunsAll(bodyText);
 
       if (parsed) {
-        // ✅ fallback по тексту только если DOM не нашёл
         const discord = domDiscord || parseDiscordFromText(bodyText);
-
         const out = { ...parsed, regionUsed: region, discord: discord || null };
         setC(ck, out);
         return out;
@@ -691,6 +667,7 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
     }
   }
 
+  // ✅ negative cache (null) now works
   setC(ck, null);
   return null;
 }
@@ -699,25 +676,29 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
 async function lowestFromRun(context, runUrl) {
   const rk = runKey(runUrl);
   const cached = getC(rk);
-  if (cached) return cached;
+  if (cached !== undefined) return cached;
 
   const roster = await fetchRunRoster(runUrl);
 
   const deadline = Date.now() + (RUN_TIMEOUT_MS - 3000);
   let best = null;
-  let done = 0;
+
+  let attempted = 0;
+  let found = 0;
 
   for (const p of roster) {
     if (Date.now() > deadline) break;
 
     const stat = await fetchTimedTotal(context, p.realm, p.name, p.region);
-    done++;
+    attempted++;
 
     if (!stat) continue;
+    found++;
+
     if (!best || stat.total < best.stat.total) best = { p, stat };
   }
 
-  const partial = done < roster.length;
+  const partial = attempted < roster.length || found < roster.length;
 
   if (!best) {
     const outFail = { ok: false, error: "no timed totals found", partial: true };
@@ -880,14 +861,19 @@ function processBatchFast(urls) {
 
     const cached = getC(runKey(u));
 
-    if (cached) {
+    if (cached !== undefined) {
       if (!cached.ok && isBrowserClosedError(cached.error)) {
         cache.delete(runKey(u));
         results[i] = { ok: false, error: "PENDING", partial: true };
         missing.push(u);
       } else {
         results[i] = cached;
-        if (cached.ok && cached.partial) needRefine.push(u);
+
+        // ✅ don't re-enqueue partial forever; respect PARTIAL_RETRY_MAX
+        if (cached.ok && cached.partial) {
+          const n = partialAttempts.get(u) || 0;
+          if (n < PARTIAL_RETRY_MAX) needRefine.push(u);
+        }
       }
     } else {
       results[i] = { ok: false, error: "PENDING", partial: true };
