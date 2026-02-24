@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: "5mb" }));
 
 // ✅ bump версии кэша (сброс кешей при изменениях)
-const CACHE_VER = "v27";
+const CACHE_VER = "v28";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -32,12 +32,18 @@ const PARTIAL_RETRY_MAX = 2;
 const PARTIAL_RETRY_DELAY_MS = 30_000;
 const partialAttempts = new Map(); // runUrl -> attempts (server-side)
 
+// warband попытка (чтобы не зависать)
 const WAR_BAND_TIMEOUT_MS = 30_000;
+
+// ✅ лимит количества URL в одном батче
 const MAX_URLS = 1500;
 
 // ✅ settle: перечитываем timed runs несколько раз (устраняет "парсим слишком рано")
 const SETTLE_ATTEMPTS = 3;
 const SETTLE_DELAY_MS = 900;
+
+// ✅ умный partial: считаем “достаточно точным”, если распарсили хотя бы 4 из 5
+const PARTIAL_OK_MIN_PARSED = 4;
 
 // =====================
 // Cache keys
@@ -269,7 +275,7 @@ async function fetchRunRoster(runUrl) {
 }
 
 // =====================
-// Timed Runs parsing (fallback text) — НЕ используем по всему body, только как последний fallback
+// Timed Runs parsing fallback (text)
 // =====================
 function parseTimedRunsAll(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
@@ -313,9 +319,8 @@ function sumTimedRange(by, minLvl = 5, maxLvl = 20) {
 }
 
 /**
- * ✅ DOM-версия timed runs (v27 FIX):
- * Парсим ТОЛЬКО внутри "карточек", где "Keystone Timed Runs" встречается ровно 1 раз.
- * Это устраняет склейку значений между плитками, которая происходит при parse по всему body.
+ * ✅ DOM-версия timed runs (рабочая из v27):
+ * парсит только внутри карточек, где "Keystone Timed Runs" встречается 1 раз.
  */
 async function extractTimedRunsFromDom(page) {
   return await page
@@ -338,19 +343,13 @@ async function extractTimedRunsFromDom(page) {
         (scoreHead && (scoreHead.closest("section,article,aside,div") || scoreHead.parentElement)) ||
         document.body;
 
-      // кандидаты на карточки: небольшие контейнеры, в которых 1 раз встречается "Keystone Timed Runs"
       const candidates = Array.from(root.querySelectorAll("div,li,section,article,a"))
         .filter((el) => {
           const t = norm(el.innerText || el.textContent || "");
           if (!t) return false;
           if (!/keystone\s+timed\s+runs/i.test(t)) return false;
           if (!/(\d{1,3})\s*[+＋]/.test(t)) return false;
-          if (!/\d/.test(t)) return false;
-
-          // важно: ровно 1 occurrence (иначе это контейнер на несколько плиток)
           if (occ(t.toLowerCase(), /keystone timed runs/g) !== 1) return false;
-
-          // ограничение размера
           if (t.length > 260) return false;
           return true;
         })
@@ -358,28 +357,22 @@ async function extractTimedRunsFromDom(page) {
 
       if (!candidates.length) return null;
 
-      // оставляем "минимальные" карточки (убираем контейнеры, которые содержат другие карточки)
-      candidates.sort((a, b) => {
-        const sa = a.querySelectorAll("*").length;
-        const sb = b.querySelectorAll("*").length;
-        return sa - sb;
-      });
+      candidates.sort((a, b) => (a.querySelectorAll("*").length || 0) - (b.querySelectorAll("*").length || 0));
 
       const cards = [];
       for (const el of candidates) {
-        if (cards.some((c) => el.contains(c))) continue; // el — слишком большой контейнер
+        if (cards.some((c) => el.contains(c))) continue;
         cards.push(el);
       }
 
       const by = {};
 
-      // Парс в рамках одной карточки => правильная связка level<->count
       for (const card of cards) {
         const t = norm(card.innerText || card.textContent || "");
         if (!t) continue;
 
-        const pA = /(\d[\d,]*)\s+(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs/i; // count level label
-        const pB = /(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs\s+(\d[\d,]*)/i; // level label count
+        const pA = /(\d[\d,]*)\s+(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs/i;
+        const pB = /(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs\s+(\d[\d,]*)/i;
 
         let m = t.match(pA);
         if (m) {
@@ -397,7 +390,6 @@ async function extractTimedRunsFromDom(page) {
           continue;
         }
 
-        // fallback внутри карточки: level + max(number not before '+')
         const mLvl = t.match(/(\d{1,3})\s*[+＋]/);
         if (!mLvl) continue;
         const level = `${mLvl[1]}+`;
@@ -424,7 +416,7 @@ async function extractTimedRunsFromDom(page) {
 }
 
 /**
- * ✅ Discord DOM extractor
+ * ✅ Discord DOM extractor (как было)
  */
 async function extractDiscordFromDom(page) {
   return await page
@@ -763,12 +755,11 @@ async function fetchWarbandUrl(context, region, realm, name) {
 }
 
 // =====================
-// Timed total fetch (season-aware + settle + debug)
+// Timed total fetch (season-aware + settle + debug) + winner_source
 // =====================
 async function fetchTimedTotal(context, realm, name, regionHint, season, debug = false) {
   const ck = ttKey(season, regionHint, realm, name);
 
-  // debug-запросы не кэшируем, чтобы видеть реальное поведение
   if (!debug) {
     const cached = getC(ck);
     if (cached !== undefined) return cached; // object|null
@@ -794,6 +785,9 @@ async function fetchTimedTotal(context, realm, name, regionHint, season, debug =
       try {
         await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 9000 });
       } catch (_) {}
+      try {
+        await page.waitForSelector('text=/Contact\\s+Info/i', { timeout: 3500 });
+      } catch (_) {}
 
       const domDiscord = await extractDiscordFromDom(page);
 
@@ -803,7 +797,6 @@ async function fetchTimedTotal(context, realm, name, regionHint, season, debug =
       for (let i = 0; i < SETTLE_ATTEMPTS; i++) {
         if (i > 0) await page.waitForTimeout(SETTLE_DELAY_MS);
 
-        // ✅ 1) DOM (v27) — должен сработать и дать корректные пары level->count
         const domTimed = await extractTimedRunsFromDom(page);
         if (domTimed && domTimed.by) {
           const r520 = sumTimedRange(domTimed.by, 5, 20);
@@ -827,11 +820,9 @@ async function fetchTimedTotal(context, realm, name, regionHint, season, debug =
               byAll: domTimed.by,
             });
           }
-
           continue;
         }
 
-        // 2) fallback text (самый последний вариант)
         const bodyText = await page.evaluate(() => document.body?.innerText || "");
         const parsed = parseTimedRunsAll(bodyText);
 
@@ -863,11 +854,6 @@ async function fetchTimedTotal(context, realm, name, regionHint, season, debug =
       }
 
       if (attempts.length) {
-        // выбираем лучший:
-        // 1) coverage max
-        // 2) dom предпочтительнее text
-        // 3) total_5_20 min
-        // 4) totalAll min
         attempts.sort((a, b) => {
           if (b.coverage !== a.coverage) return b.coverage - a.coverage;
           if (a.source !== b.source) return a.source === "dom" ? -1 : 1;
@@ -883,8 +869,9 @@ async function fetchTimedTotal(context, realm, name, regionHint, season, debug =
           total: best.totalAll ?? best.total520,
           by: best.by,
           regionUsed: region,
-          discord: domDiscord || null,
+          discord: domDiscord || parseDiscordFromText(await page.evaluate(() => document.body?.innerText || "")) || null,
           seasonUsed: season || "",
+          source: best.source, // ✅ dom/text
           ver: CACHE_VER,
           _settle: debug ? attemptLog : undefined,
         };
@@ -903,46 +890,58 @@ async function fetchTimedTotal(context, realm, name, regionHint, season, debug =
   return null;
 }
 
-// =====================
-// Lowest for run (✅ выбираем по 5..20)
-// =====================
+// --- lowest for run (✅ выбираем по 5..20) + умный partial + счётчики ---
 async function lowestFromRun(context, runUrl) {
   const rk = runKey(runUrl);
   const cached = getC(rk);
   if (cached !== undefined) return cached;
 
   const roster = await fetchRunRoster(runUrl);
+  const roster_total = roster.length;
   const season = seasonFromRunUrl(runUrl);
 
   const deadline = Date.now() + (RUN_TIMEOUT_MS - 3000);
 
   let best = null; // {p, stat, t520}
   let attempted = 0;
-  let found = 0;
+  let parsed_ok = 0;
+  let parsed_failed = 0;
 
   for (const p of roster) {
     if (Date.now() > deadline) break;
 
-    const stat = await fetchTimedTotal(context, p.realm, p.name, p.region, season, false);
     attempted++;
+    const stat = await fetchTimedTotal(context, p.realm, p.name, p.region, season, false);
 
-    if (!stat) continue;
-    found++;
+    if (!stat) {
+      parsed_failed++;
+      continue;
+    }
+    parsed_ok++;
 
     const t520 = sumTimedRange(stat.by, 5, 20).total;
     if (!best || t520 < best.t520) best = { p, stat, t520 };
   }
 
-  const partial = attempted < roster.length || found < roster.length;
-
   if (!best) {
-    const outFail = { ok: false, error: "no timed totals found", partial: true, ver: CACHE_VER };
+    const outFail = {
+      ok: false,
+      ver: CACHE_VER,
+      error: "no timed totals found",
+      partial: true,
+      roster_total,
+      parsed_ok,
+      parsed_failed,
+      attempted,
+      season: season || "",
+    };
     setC(rk, outFail, 10 * 60 * 1000);
     return outFail;
   }
 
   const label = `${best.p.name}-${best.p.realm}`.toLowerCase();
   const regionForUrl = best.stat.regionUsed || best.p.region || "eu";
+
   const profile_url = `https://raider.io/characters/${regionForUrl}/${encodeURIComponent(
     best.p.realm
   )}/${encodeURIComponent(best.p.name)}${season ? `?season=${encodeURIComponent(season)}` : ""}`;
@@ -958,6 +957,13 @@ async function lowestFromRun(context, runUrl) {
     warband_url = null;
   }
 
+  const winner_source = best.stat.source || "text";
+
+  // ✅ умный partial:
+  // - если распарсили >=4 игроков и победитель из DOM — считаем, что риск ошибки низкий
+  // - иначе partial=true (просим перепроверить/дозалить)
+  const partialSmart = !(parsed_ok >= PARTIAL_OK_MIN_PARSED && winner_source === "dom");
+
   const out = {
     ok: true,
     ver: CACHE_VER,
@@ -965,14 +971,24 @@ async function lowestFromRun(context, runUrl) {
     profile_url,
     discord: best.stat.discord || null,
     warband_url: warband_url || null,
+
     timed_total_5_20: best.t520,
     timed_total: best.stat.total,
     timed_breakdown: best.stat.by,
+
     season: season || "",
-    partial,
+
+    // ✅ диагностика
+    roster_total,
+    parsed_ok,
+    parsed_failed,
+    attempted,
+    winner_source,
+
+    partial: partialSmart,
   };
 
-  setC(rk, out, partial ? 20 * 60 * 1000 : TTL_MS);
+  setC(rk, out, partialSmart ? 20 * 60 * 1000 : TTL_MS);
   return out;
 }
 
@@ -1185,8 +1201,7 @@ app.get("/lowest-from-run", async (req, res) => {
   }
 });
 
-// helper: total 5..20 для конкретного чара + season
-// ✅ debug=1 → вернёт 3 попытки settle (что именно увидел Playwright)
+// helper: timed-total по конкретному персонажу
 app.get("/timed-total", async (req, res) => {
   const url = String(req.query.url || "").trim();
   if (!url) return res.status(400).json({ ok: false, error: "missing url", ver: CACHE_VER });
@@ -1221,6 +1236,7 @@ app.get("/timed-total", async (req, res) => {
       total_all_levels: stat.total,
       breakdown_all_levels: stat.by,
       regionUsed: stat.regionUsed || regionHint,
+      source: stat.source || "text",
       settle: debug ? stat._settle : undefined,
     });
   } catch (e) {
