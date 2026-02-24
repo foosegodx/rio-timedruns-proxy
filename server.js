@@ -49,12 +49,12 @@ function now() {
 // ✅ FIX: distinguish cache miss vs cached null
 function getC(k) {
   const v = cache.get(k);
-  if (!v) return undefined;
+  if (!v) return undefined; // miss
   if (now() > v.exp) {
     cache.delete(k);
-    return undefined;
+    return undefined; // expired miss
   }
-  return v.val; // may be null, object, etc.
+  return v.val; // may be null
 }
 function setC(k, val, ttlMs = TTL_MS) {
   cache.set(k, { val, exp: now() + ttlMs });
@@ -274,6 +274,22 @@ function parseTimedRunsAll(text) {
 
   const total = keys.reduce((s, k) => s + (by[k] || 0), 0);
   return { total, by };
+}
+
+// ✅ суммирование только диапазона 5..20 (включительно)
+function sumTimedRange(by, minLvl = 5, maxLvl = 20) {
+  let total = 0;
+  const out = {};
+  for (const [k, v] of Object.entries(by || {})) {
+    const lvl = parseInt(String(k).replace("+", ""), 10);
+    if (!Number.isFinite(lvl)) continue;
+    if (lvl >= minLvl && lvl <= maxLvl) {
+      const n = Number(v) || 0;
+      out[`${lvl}+`] = n;
+      total += n;
+    }
+  }
+  return { total, by: out };
 }
 
 /**
@@ -667,7 +683,7 @@ async function fetchTimedTotal(context, realm, name, regionHint) {
     }
   }
 
-  // ✅ negative cache (null) now works
+  // ✅ negative cache (null) works now
   setC(ck, null);
   return null;
 }
@@ -944,6 +960,42 @@ app.get("/lowest-from-run", async (req, res) => {
     const context = await getContext();
     const out = await lowestFromRun(context, String(runUrl).trim());
     return res.json(out);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// ✅ character helper: total только 5..20 (включительно)
+app.get("/timed-total", async (req, res) => {
+  const url = String(req.query.url || "").trim();
+  if (!url) return res.status(400).json({ ok: false, error: "missing url" });
+
+  const m = url.match(/raider\.io\/characters\/([^/]+)\/([^/]+)\/([^/?#]+)/i);
+  if (!m) return res.status(400).json({ ok: false, error: "bad character url" });
+
+  const regionHint = String(m[1] || "").toLowerCase();
+  const realm = decodeURIComponent(m[2] || "");
+  const name = decodeURIComponent(m[3] || "");
+
+  try {
+    const context = await getContext();
+    const stat = await fetchTimedTotal(context, realm, name, regionHint);
+
+    if (!stat) return res.json({ ok: false, error: "no timed totals found" });
+
+    const r = sumTimedRange(stat.by, 5, 20);
+
+    return res.json({
+      ok: true,
+      profile_url: `https://raider.io/characters/${stat.regionUsed || regionHint}/${encodeURIComponent(
+        realm
+      )}/${encodeURIComponent(name)}`,
+      total_5_20: r.total,
+      breakdown_5_20: r.by,
+      total_all_levels: stat.total,
+      breakdown_all_levels: stat.by,
+      regionUsed: stat.regionUsed || regionHint,
+    });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e.message || e) });
   }
