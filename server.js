@@ -6,11 +6,10 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ✅ чтобы спокойно принимать 1500 ссылок
 app.use(express.json({ limit: "5mb" }));
 
-// ✅ bump версии кэша (сброс кешей при изменениях)
-const CACHE_VER = "v19";
+// ✅ bump версии кэша
+const CACHE_VER = "v20";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -24,32 +23,24 @@ const UA =
 const RUN_TIMEOUT_MS = 140_000;
 const INFLIGHT_STALE_MS = 3 * 70_000;
 
-// скорость
 const WORKER_BATCH = 6;
 const WORKER_PARALLEL = 2;
 
-// partial — попробуем дорефайнить позже
 const PARTIAL_RETRY_MAX = 2;
 const PARTIAL_RETRY_DELAY_MS = 30_000;
 const partialAttempts = new Map(); // runUrl -> attempts (server-side)
 
-// warband попытка (чтобы не зависать)
 const WAR_BAND_TIMEOUT_MS = 30_000;
-
-// ✅ лимит количества URL в одном батче
 const MAX_URLS = 1500;
 
 // =====================
 // Cache keys
 // =====================
 const runKey = (u) => `run:${CACHE_VER}:${u}`;
-
-// ✅ season-aware timed-total cache key
 const ttKey = (season, regionHint, realm, name) =>
   `tt:${CACHE_VER}:${String(season || "")}:${(regionHint || "").toLowerCase()}:${String(realm)}:${String(
     name
   )}`.toLowerCase();
-
 const wbKey = (region, realm, name) =>
   `wb:${CACHE_VER}:${region}:${String(realm)}:${String(name)}`.toLowerCase();
 
@@ -98,7 +89,6 @@ function normalizeRegion(regionRaw) {
   return "";
 }
 
-// base64 websafe (Apps Script) -> utf8 (для legacy GET)
 function decodeBase64WebSafeToUtf8(enc) {
   const s = String(enc || "");
   let b64 = s.replace(/-/g, "+").replace(/_/g, "/");
@@ -198,7 +188,6 @@ async function getContext() {
     const browser = await browserPromise;
     const context = await browser.newContext({ userAgent: UA });
 
-    // ✅ режем лишнее, но stylesheet оставляем
     await context.route("**/*", (route) => {
       const rt = route.request().resourceType();
       if (!["document", "script", "xhr", "fetch", "stylesheet"].includes(rt)) return route.abort();
@@ -279,17 +268,18 @@ function parseTimedRunsAll(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const by = {};
 
-  const p1 = /(\d[\d,]*)\s+(\d{1,2}\+)\s+Keystone\s+Timed\s+Runs/gi;
-  const p2 = /(\d{1,2}\+)\s+Keystone\s+Timed\s+Runs\s+(\d[\d,]*)/gi;
+  // поддержим и обычный +, и полноширинный ＋
+  const p1 = /(\d[\d,]*)\s+(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs/gi;
+  const p2 = /(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs\s*[:\-]?\s*(\d[\d,]*)/gi;
 
   let m;
   while ((m = p1.exec(t)) !== null) {
     const count = Number(String(m[1]).replace(/,/g, ""));
-    const level = m[2];
+    const level = String(m[2]).replace(/\uFF0B/g, "+");
     if (Number.isFinite(count)) by[level] = Math.max(by[level] || 0, count);
   }
   while ((m = p2.exec(t)) !== null) {
-    const level = m[1];
+    const level = String(m[1]).replace(/\uFF0B/g, "+");
     const count = Number(String(m[2]).replace(/,/g, ""));
     if (Number.isFinite(count)) by[level] = Math.max(by[level] || 0, count);
   }
@@ -315,6 +305,72 @@ function sumTimedRange(by, minLvl = 5, maxLvl = 20) {
     }
   }
   return { total, by: out };
+}
+
+/**
+ * ✅ DOM-версия timed runs: пытаемся достать значения ИМЕННО из секции Mythic+ (рядом с "Mythic+ Score").
+ * Возвращает { total, by } или null.
+ */
+async function extractTimedRunsFromDom(page) {
+  return await page
+    .evaluate(() => {
+      const norm = (s) =>
+        String(s || "")
+          .replace(/\u00a0/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+
+      const isDigits = (s) => /^\d[\d,]*$/.test(norm(s));
+      const getLevel = (s) => {
+        const m = norm(s).match(/(\d{1,3})\s*[+＋]/);
+        return m ? `${m[1]}+` : null;
+      };
+
+      // 1) пытаемся найти корневую секцию Mythic+ по заголовку "Mythic+ Score"
+      const all = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"));
+      const scoreHead = all.find((el) => /mythic\+\s*score/i.test(el.textContent || ""));
+      const root =
+        (scoreHead && (scoreHead.closest("section,article,aside,div") || scoreHead.parentElement)) ||
+        document.body;
+
+      // 2) внутри root ищем лейблы с "Keystone Timed Runs" и уровнем "10+ / 15+ / 20+ / 5+"
+      const labels = Array.from(root.querySelectorAll("div,span,p,a,li"))
+        .filter((el) => {
+          const t = norm(el.textContent);
+          return /keystone timed runs/i.test(t) && /(\d{1,3})\s*[+＋]/.test(t);
+        })
+        .slice(0, 200);
+
+      const by = {};
+
+      for (const lab of labels) {
+        const lvl = getLevel(lab.textContent);
+        if (!lvl) continue;
+
+        const card = lab.closest("div,li,a,section") || lab.parentElement || lab;
+
+        // ищем число в этой карточке (обычно отдельным элементом)
+        const nums = Array.from(card.querySelectorAll("div,span,p,strong,b"))
+          .map((x) => norm(x.textContent))
+          .filter((x) => x && isDigits(x));
+
+        // берём первое "чистое" число (это обычно и есть 148/86/180…)
+        const raw = nums.length ? nums[0] : null;
+        if (!raw) continue;
+
+        const count = Number(raw.replace(/,/g, ""));
+        if (!Number.isFinite(count)) continue;
+
+        by[lvl] = Math.max(by[lvl] || 0, count);
+      }
+
+      const keys = Object.keys(by);
+      if (!keys.length) return null;
+
+      const total = keys.reduce((s, k) => s + (by[k] || 0), 0);
+      return { total, by };
+    })
+    .catch(() => null);
 }
 
 /**
@@ -416,9 +472,6 @@ async function extractDiscordFromDom(page) {
     .catch(() => null);
 }
 
-/**
- * ✅ Fallback по тексту (безопасный): берём ТОЛЬКО "name#1234".
- */
 function parseDiscordFromText(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const idx = t.toLowerCase().indexOf("contact info");
@@ -662,7 +715,7 @@ async function fetchWarbandUrl(context, region, realm, name) {
 }
 
 // =====================
-// Timed total fetch (season-aware)
+// Timed total fetch (season-aware + DOM-first)
 // =====================
 async function fetchTimedTotal(context, realm, name, regionHint, season) {
   const ck = ttKey(season, regionHint, realm, name);
@@ -690,11 +743,29 @@ async function fetchTimedTotal(context, realm, name, regionHint, season) {
         await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 6000 });
       } catch (_) {}
       try {
+        await page.waitForSelector('text=/Mythic\\+\\s*Score/i', { timeout: 5000 });
+      } catch (_) {}
+      try {
         await page.waitForSelector('text=/Contact\\s+Info/i', { timeout: 5000 });
       } catch (_) {}
 
       const domDiscord = await extractDiscordFromDom(page);
 
+      // ✅ СНАЧАЛА DOM timed-runs (точнее, не путает сезоны/блоки)
+      const domTimed = await extractTimedRunsFromDom(page);
+      if (domTimed) {
+        const out = {
+          total: domTimed.total,
+          by: domTimed.by,
+          regionUsed: region,
+          discord: domDiscord || null,
+          seasonUsed: season || "",
+        };
+        setC(ck, out);
+        return out;
+      }
+
+      // fallback: текстовый парсер (как раньше)
       const bodyText = await page.evaluate(() => document.body?.innerText || "");
       const parsed = parseTimedRunsAll(bodyText);
 
@@ -711,13 +782,12 @@ async function fetchTimedTotal(context, realm, name, regionHint, season) {
     }
   }
 
-  // ✅ negative cache
   setC(ck, null);
   return null;
 }
 
 // =====================
-// Lowest for run
+// Lowest for run (✅ выбираем по 5..20)
 // =====================
 async function lowestFromRun(context, runUrl) {
   const rk = runKey(runUrl);
@@ -728,8 +798,8 @@ async function lowestFromRun(context, runUrl) {
   const season = seasonFromRunUrl(runUrl);
 
   const deadline = Date.now() + (RUN_TIMEOUT_MS - 3000);
-  let best = null;
 
+  let best = null; // {p, stat, t520}
   let attempted = 0;
   let found = 0;
 
@@ -742,7 +812,9 @@ async function lowestFromRun(context, runUrl) {
     if (!stat) continue;
     found++;
 
-    if (!best || stat.total < best.stat.total) best = { p, stat };
+    const t520 = sumTimedRange(stat.by, 5, 20).total;
+
+    if (!best || t520 < best.t520) best = { p, stat, t520 };
   }
 
   const partial = attempted < roster.length || found < roster.length;
@@ -755,6 +827,7 @@ async function lowestFromRun(context, runUrl) {
 
   const label = `${best.p.name}-${best.p.realm}`.toLowerCase();
   const regionForUrl = best.stat.regionUsed || best.p.region || "eu";
+
   const profile_url = `https://raider.io/characters/${regionForUrl}/${encodeURIComponent(
     best.p.realm
   )}/${encodeURIComponent(best.p.name)}${season ? `?season=${encodeURIComponent(season)}` : ""}`;
@@ -776,8 +849,14 @@ async function lowestFromRun(context, runUrl) {
     profile_url,
     discord: best.stat.discord || null,
     warband_url: warband_url || null,
+
+    // ✅ что именно сравнивали
+    timed_total_5_20: best.t520,
+
+    // оставим и полный breakdown (как раньше)
     timed_total: best.stat.total,
     timed_breakdown: best.stat.by,
+
     season: season || "",
     partial,
   };
@@ -997,9 +1076,7 @@ app.get("/lowest-from-run", async (req, res) => {
   }
 });
 
-// ✅ character helper: total только 5..20 (включительно) + season param
-// usage:
-// /timed-total?url=https://raider.io/characters/eu/zenedar/Atrius&season=season-tww-3
+// helper: total 5..20 для конкретного чара + season
 app.get("/timed-total", async (req, res) => {
   const url = String(req.query.url || "").trim();
   if (!url) return res.status(400).json({ ok: false, error: "missing url" });
@@ -1062,7 +1139,6 @@ app.get("/lowest-from-runs-get", async (req, res) => {
   }
 });
 
-// ✅ основной endpoint для Sheets
 app.post("/lowest-from-runs", async (req, res) => {
   try {
     const full = String(req.query.full || "") === "1";
