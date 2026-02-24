@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: "5mb" }));
 
 // ✅ bump версии кэша (сброс кешей при изменениях)
-const CACHE_VER = "v26";
+const CACHE_VER = "v27";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -43,12 +43,10 @@ const SETTLE_DELAY_MS = 900;
 // Cache keys
 // =====================
 const runKey = (u) => `run:${CACHE_VER}:${u}`;
-
 const ttKey = (season, regionHint, realm, name) =>
   `tt:${CACHE_VER}:${String(season || "")}:${(regionHint || "").toLowerCase()}:${String(realm)}:${String(
     name
   )}`.toLowerCase();
-
 const wbKey = (region, realm, name) =>
   `wb:${CACHE_VER}:${region}:${String(realm)}:${String(name)}`.toLowerCase();
 
@@ -271,7 +269,7 @@ async function fetchRunRoster(runUrl) {
 }
 
 // =====================
-// Timed Runs parsing (fallback text) — ОСТОРОЖНО: DOM порядок в headless может "путать пары"
+// Timed Runs parsing (fallback text) — НЕ используем по всему body, только как последний fallback
 // =====================
 function parseTimedRunsAll(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
@@ -315,14 +313,9 @@ function sumTimedRange(by, minLvl = 5, maxLvl = 20) {
 }
 
 /**
- * ✅ DOM-версия timed runs (v26 FIX):
- * Парим "уровень -> число" НЕ через innerText-порядок,
- * а через "карточку" вокруг конкретного label:
- *  - находим элементы с текстом "X+ Keystone Timed Runs"
- *  - для каждого ищем лучший ancestor, который "похож на карточку" и содержит count-число
- *  - внутри карточки берём MAX из числовых leaf-элементов (обычно это и есть count)
- *
- * Это лечит кейс Atrius, где headless innerText даёт сдвиг 20+=86.
+ * ✅ DOM-версия timed runs (v27 FIX):
+ * Парсим ТОЛЬКО внутри "карточек", где "Keystone Timed Runs" встречается ровно 1 раз.
+ * Это устраняет склейку значений между плитками, которая происходит при parse по всему body.
  */
 async function extractTimedRunsFromDom(page) {
   return await page
@@ -333,12 +326,10 @@ async function extractTimedRunsFromDom(page) {
           .replace(/\s+/g, " ")
           .trim();
 
-      const getLevel = (s) => {
-        const m = norm(s).match(/(\d{1,3})\s*[+＋]/);
-        return m ? `${m[1]}+` : null;
+      const occ = (txt, re) => {
+        const m = String(txt).match(re);
+        return m ? m.length : 0;
       };
-
-      const isDigits = (s) => /^\d[\d,]*$/.test(norm(s));
 
       // ограничиваем область Mythic+ секцией
       const all = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"));
@@ -347,78 +338,84 @@ async function extractTimedRunsFromDom(page) {
         (scoreHead && (scoreHead.closest("section,article,aside,div") || scoreHead.parentElement)) ||
         document.body;
 
-      // label элементы (стараемся брать "минимальные", чтобы не дублировались)
-      const rawLabels = Array.from(root.querySelectorAll("*"))
+      // кандидаты на карточки: небольшие контейнеры, в которых 1 раз встречается "Keystone Timed Runs"
+      const candidates = Array.from(root.querySelectorAll("div,li,section,article,a"))
         .filter((el) => {
-          const t = norm(el.textContent || "");
-          return /keystone\s+timed\s+runs/i.test(t) && /(\d{1,3})\s*[+＋]/.test(t);
+          const t = norm(el.innerText || el.textContent || "");
+          if (!t) return false;
+          if (!/keystone\s+timed\s+runs/i.test(t)) return false;
+          if (!/(\d{1,3})\s*[+＋]/.test(t)) return false;
+          if (!/\d/.test(t)) return false;
+
+          // важно: ровно 1 occurrence (иначе это контейнер на несколько плиток)
+          if (occ(t.toLowerCase(), /keystone timed runs/g) !== 1) return false;
+
+          // ограничение размера
+          if (t.length > 260) return false;
+          return true;
         })
         .slice(0, 300);
 
-      // минимизация: если у элемента есть потомок, который тоже label — пропускаем родителя
-      const labels = rawLabels.filter((el) => {
-        for (const ch of rawLabels) {
-          if (ch !== el && el.contains(ch)) return false;
-        }
-        return true;
+      if (!candidates.length) return null;
+
+      // оставляем "минимальные" карточки (убираем контейнеры, которые содержат другие карточки)
+      candidates.sort((a, b) => {
+        const sa = a.querySelectorAll("*").length;
+        const sb = b.querySelectorAll("*").length;
+        return sa - sb;
       });
 
-      if (!labels.length) return null;
-
-      const countLabelsInside = (node) => {
-        let c = 0;
-        for (const l of labels) if (node.contains(l)) c++;
-        return c;
-      };
-
-      const findCountInCard = (card) => {
-        // ищем числовые leaf элементы внутри карточки
-        const leaves = Array.from(card.querySelectorAll("*"))
-          .filter((x) => !x.children || x.children.length === 0)
-          .map((x) => norm(x.textContent || ""))
-          .filter((t) => t && isDigits(t))
-          .map((t) => Number(t.replace(/,/g, "")))
-          .filter((n) => Number.isFinite(n));
-
-        if (!leaves.length) return null;
-        return Math.max(...leaves);
-      };
+      const cards = [];
+      for (const el of candidates) {
+        if (cards.some((c) => el.contains(c))) continue; // el — слишком большой контейнер
+        cards.push(el);
+      }
 
       const by = {};
 
-      for (const lab of labels) {
-        const lvl = getLevel(lab.textContent || "");
-        if (!lvl) continue;
+      // Парс в рамках одной карточки => правильная связка level<->count
+      for (const card of cards) {
+        const t = norm(card.innerText || card.textContent || "");
+        if (!t) continue;
 
-        // ищем лучший ancestor-кандидат (не обязательно с labelCount==1, но штрафуем за "много labels")
-        let cur = lab;
-        let best = null; // {cnt, score}
-        for (let depth = 0; depth < 10; depth++) {
-          if (!cur) break;
+        const pA = /(\d[\d,]*)\s+(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs/i; // count level label
+        const pB = /(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs\s+(\d[\d,]*)/i; // level label count
 
-          const lc = countLabelsInside(cur);
-          const cnt = findCountInCard(cur);
-
-          if (cnt !== null) {
-            const txtLen = norm(cur.innerText || cur.textContent || "").length;
-            // score: меньше labels + меньше текста => ближе к "карточке"
-            const score = lc * 1000 + txtLen;
-            if (!best || score < best.score) best = { cnt, score };
-          }
-
-          cur = cur.parentElement;
-          // safety: не уходим слишком высоко
-          if (!cur || cur === root) break;
+        let m = t.match(pA);
+        if (m) {
+          const count = Number(String(m[1]).replace(/,/g, ""));
+          const level = String(m[2]).replace(/\uFF0B/g, "+");
+          if (Number.isFinite(count)) by[level] = Math.max(by[level] || 0, count);
+          continue;
         }
 
-        if (!best) continue;
+        m = t.match(pB);
+        if (m) {
+          const level = String(m[1]).replace(/\uFF0B/g, "+");
+          const count = Number(String(m[2]).replace(/,/g, ""));
+          if (Number.isFinite(count)) by[level] = Math.max(by[level] || 0, count);
+          continue;
+        }
 
-        // фиксируем максимум (если встречается дубликат уровня)
-        by[lvl] = Math.max(by[lvl] || 0, best.cnt);
+        // fallback внутри карточки: level + max(number not before '+')
+        const mLvl = t.match(/(\d{1,3})\s*[+＋]/);
+        if (!mLvl) continue;
+        const level = `${mLvl[1]}+`;
+
+        const nums = [];
+        const reNum = /\b(\d[\d,]*)\b(?!\s*[+＋])/g;
+        let mm;
+        while ((mm = reNum.exec(t)) !== null) {
+          const n = Number(String(mm[1]).replace(/,/g, ""));
+          if (Number.isFinite(n)) nums.push(n);
+        }
+        if (!nums.length) continue;
+
+        by[level] = Math.max(by[level] || 0, Math.max(...nums));
       }
 
       const keys = Object.keys(by);
-      if (keys.length < 3) return null; // хотим хотя бы 10/15/20
+      if (!keys.length) return null;
 
       const total = keys.reduce((s, k) => s + (by[k] || 0), 0);
       return { total, by };
@@ -806,7 +803,7 @@ async function fetchTimedTotal(context, realm, name, regionHint, season, debug =
       for (let i = 0; i < SETTLE_ATTEMPTS; i++) {
         if (i > 0) await page.waitForTimeout(SETTLE_DELAY_MS);
 
-        // 1) DOM (правильное сопоставление level->count)
+        // ✅ 1) DOM (v27) — должен сработать и дать корректные пары level->count
         const domTimed = await extractTimedRunsFromDom(page);
         if (domTimed && domTimed.by) {
           const r520 = sumTimedRange(domTimed.by, 5, 20);
@@ -831,11 +828,10 @@ async function fetchTimedTotal(context, realm, name, regionHint, season, debug =
             });
           }
 
-          // если DOM дал 3-4 уровня — это почти всегда лучший результат
           continue;
         }
 
-        // 2) fallback text (может путать пары в headless)
+        // 2) fallback text (самый последний вариант)
         const bodyText = await page.evaluate(() => document.body?.innerText || "");
         const parsed = parseTimedRunsAll(bodyText);
 
