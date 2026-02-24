@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: "5mb" }));
 
 // ✅ bump версии кэша (сброс кешей при изменениях)
-const CACHE_VER = "v24";
+const CACHE_VER = "v25";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -32,18 +32,18 @@ const PARTIAL_RETRY_MAX = 2;
 const PARTIAL_RETRY_DELAY_MS = 30_000;
 const partialAttempts = new Map(); // runUrl -> attempts (server-side)
 
-// warband попытка (чтобы не зависать)
 const WAR_BAND_TIMEOUT_MS = 30_000;
-
-// ✅ лимит количества URL в одном батче
 const MAX_URLS = 1500;
+
+// ✅ settle: перечитываем timed runs несколько раз (устраняет "парсим слишком рано")
+const SETTLE_ATTEMPTS = 3;
+const SETTLE_DELAY_MS = 900;
 
 // =====================
 // Cache keys
 // =====================
 const runKey = (u) => `run:${CACHE_VER}:${u}`;
 
-// ✅ season-aware timed-total cache key
 const ttKey = (season, regionHint, realm, name) =>
   `tt:${CACHE_VER}:${String(season || "")}:${(regionHint || "").toLowerCase()}:${String(realm)}:${String(
     name
@@ -97,7 +97,6 @@ function normalizeRegion(regionRaw) {
   return "";
 }
 
-// base64 websafe (Apps Script) -> utf8 (для legacy GET)
 function decodeBase64WebSafeToUtf8(enc) {
   const s = String(enc || "");
   let b64 = s.replace(/-/g, "+").replace(/_/g, "/");
@@ -197,7 +196,6 @@ async function getContext() {
     const browser = await browserPromise;
     const context = await browser.newContext({ userAgent: UA });
 
-    // ✅ режем лишнее, но stylesheet оставляем
     await context.route("**/*", (route) => {
       const rt = route.request().resourceType();
       if (!["document", "script", "xhr", "fetch", "stylesheet"].includes(rt)) return route.abort();
@@ -278,7 +276,6 @@ function parseTimedRunsAll(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const by = {};
 
-  // поддержим и обычный +, и полноширинный ＋
   const p1 = /(\d[\d,]*)\s+(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs/gi;
   const p2 = /(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs\s*[:\-]?\s*(\d[\d,]*)/gi;
 
@@ -301,7 +298,6 @@ function parseTimedRunsAll(text) {
   return { total, by };
 }
 
-// ✅ суммирование только диапазона 5..20 (включительно)
 function sumTimedRange(by, minLvl = 5, maxLvl = 20) {
   let total = 0;
   const out = {};
@@ -318,12 +314,8 @@ function sumTimedRange(by, minLvl = 5, maxLvl = 20) {
 }
 
 /**
- * ✅ DOM-версия timed runs (v24):
- * - находим "плитки" (card), где "Keystone Timed Runs" встречается ровно 1 раз
- * - внутри card берём:
- *    level = \d+ + (например 20+)
- *    count = число НЕ перед '+'
- * Это устраняет “сдвиги” типа 20+=86, 15+=180.
+ * ✅ DOM-версия timed runs:
+ * (оставляем как best-effort; settle выберет лучший снимок)
  */
 async function extractTimedRunsFromDom(page) {
   return await page
@@ -334,58 +326,23 @@ async function extractTimedRunsFromDom(page) {
           .replace(/\s+/g, " ")
           .trim();
 
-      const countOcc = (txt, re) => {
-        const m = String(txt).match(re);
-        return m ? m.length : 0;
-      };
-
-      // ограничиваем область Mythic+ секцией
       const all = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"));
       const scoreHead = all.find((el) => /mythic\+\s*score/i.test(el.textContent || ""));
       const root =
         (scoreHead && (scoreHead.closest("section,article,aside,div") || scoreHead.parentElement)) ||
         document.body;
 
-      // ищем элементы, где есть "Keystone Timed Runs"
-      const seeds = Array.from(root.querySelectorAll("*"))
+      // ищем плитки с "Keystone Timed Runs" (приближённо)
+      const tiles = Array.from(root.querySelectorAll("*"))
         .filter((el) => /keystone\s+timed\s+runs/i.test(el.textContent || ""))
-        .slice(0, 800);
-
-      const tiles = [];
-      const seen = new Set();
-
-      // поднимаемся вверх от seed и ищем "tile" с 1х 'Keystone Timed Runs'
-      for (const s of seeds) {
-        let cur = s;
-        for (let i = 0; i < 10; i++) {
-          if (!cur) break;
-
-          const txt = norm(cur.innerText || cur.textContent || "");
-          if (txt) {
-            const occ = countOcc(txt.toLowerCase(), /keystone timed runs/g);
-            const hasLevel = /(\d{1,3})\s*[+＋]/.test(txt);
-            const hasCount = /\b(\d[\d,]*)\b(?!\s*[+＋])/g.test(txt);
-
-            // ограничение по размеру текста: чтобы не схватить большой контейнер на 3 плитки
-            if (occ === 1 && hasLevel && hasCount && txt.length <= 160) {
-              const key = cur.dataset?.reactid || cur.id || cur.outerHTML?.slice(0, 80) || String(cur);
-              if (!seen.has(key)) {
-                seen.add(key);
-                tiles.push(cur);
-              }
-              break;
-            }
-          }
-
-          cur = cur.parentElement;
-        }
-      }
+        .slice(0, 600);
 
       const by = {};
 
-      for (const tile of tiles) {
-        const txt = norm(tile.innerText || tile.textContent || "");
-        if (!txt) continue;
+      for (const el of tiles) {
+        const txt = norm(el.innerText || el.textContent || "");
+        if (!txt || txt.length > 240) continue;
+        if (!/keystone timed runs/i.test(txt)) continue;
 
         const mLvl = txt.match(/(\d{1,3})\s*[+＋]/);
         if (!mLvl) continue;
@@ -401,10 +358,8 @@ async function extractTimedRunsFromDom(page) {
         }
         if (!nums.length) continue;
 
-        // в плитке обычно 1 число — count. если их несколько, берём max (надёжнее)
         const count = Math.max(...nums);
 
-        // если есть дубликаты уровня (вдруг), оставим MIN (чтобы не схватить "общий" блок)
         if (by[lvl] === undefined) by[lvl] = count;
         else by[lvl] = Math.min(by[lvl], count);
       }
@@ -419,7 +374,7 @@ async function extractTimedRunsFromDom(page) {
 }
 
 /**
- * ✅ Discord DOM extractor (как было)
+ * ✅ Discord DOM extractor
  */
 async function extractDiscordFromDom(page) {
   return await page
@@ -517,9 +472,6 @@ async function extractDiscordFromDom(page) {
     .catch(() => null);
 }
 
-/**
- * ✅ Text fallback discord (как было)
- */
 function parseDiscordFromText(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const idx = t.toLowerCase().indexOf("contact info");
@@ -760,14 +712,17 @@ async function fetchWarbandUrl(context, region, realm, name) {
   }
 }
 
-/**
- * ✅ Возвращает { total, by, regionUsed, discord } или null
- * ✅ season-aware: открываем профиль с ?season=...
- */
-async function fetchTimedTotal(context, realm, name, regionHint, season) {
+// =====================
+// Timed total fetch (season-aware + settle + debug)
+// =====================
+async function fetchTimedTotal(context, realm, name, regionHint, season, debug = false) {
   const ck = ttKey(season, regionHint, realm, name);
-  const cached = getC(ck);
-  if (cached !== undefined) return cached; // object|null
+
+  // debug-запросы не кэшируем, чтобы видеть реальное поведение
+  if (!debug) {
+    const cached = getC(ck);
+    if (cached !== undefined) return cached; // object|null
+  }
 
   const tryRegions = [];
   if (regionHint && regions.includes(regionHint)) tryRegions.push(regionHint);
@@ -787,39 +742,85 @@ async function fetchTimedTotal(context, realm, name, regionHint, season) {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
 
       try {
-        await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 7000 });
-      } catch (_) {}
-      try {
-        await page.waitForSelector('text=/Mythic\\+\\s*Score/i', { timeout: 5000 });
-      } catch (_) {}
-      try {
-        await page.waitForSelector('text=/Contact\\s+Info/i', { timeout: 5000 });
+        await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 9000 });
       } catch (_) {}
 
       const domDiscord = await extractDiscordFromDom(page);
 
-      // ✅ DOM timed runs (v24)
-      const domTimed = await extractTimedRunsFromDom(page);
-      if (domTimed) {
+      const attemptLog = [];
+      const attempts = [];
+
+      for (let i = 0; i < SETTLE_ATTEMPTS; i++) {
+        if (i > 0) await page.waitForTimeout(SETTLE_DELAY_MS);
+
+        let by = null;
+        let totalAll = null;
+        let source = "none";
+
+        const domTimed = await extractTimedRunsFromDom(page);
+        if (domTimed && domTimed.by) {
+          by = domTimed.by;
+          totalAll = domTimed.total;
+          source = "dom";
+        } else {
+          const bodyText = await page.evaluate(() => document.body?.innerText || "");
+          const parsed = parseTimedRunsAll(bodyText);
+          if (parsed && parsed.by) {
+            by = parsed.by;
+            totalAll = parsed.total;
+            source = "text";
+          }
+        }
+
+        if (by) {
+          const r520 = sumTimedRange(by, 5, 20);
+          const coverage = Object.keys(r520.by || {}).length;
+
+          attempts.push({
+            by,
+            totalAll: Number.isFinite(totalAll) ? totalAll : null,
+            total520: r520.total,
+            coverage,
+            source,
+          });
+
+          if (debug) {
+            attemptLog.push({
+              i,
+              source,
+              coverage,
+              total520: r520.total,
+              by: r520.by,
+              byAll: by,
+            });
+          }
+        } else if (debug) {
+          attemptLog.push({ i, source, coverage: 0, total520: null, by: null, byAll: null });
+        }
+      }
+
+      if (attempts.length) {
+        attempts.sort((a, b) => {
+          if (b.coverage !== a.coverage) return b.coverage - a.coverage;
+          if (a.total520 !== b.total520) return a.total520 - b.total520;
+          const aa = a.totalAll ?? 1e18;
+          const bb = b.totalAll ?? 1e18;
+          return aa - bb;
+        });
+
+        const best = attempts[0];
+
         const out = {
-          total: domTimed.total,
-          by: domTimed.by,
+          total: best.totalAll ?? best.total520,
+          by: best.by,
           regionUsed: region,
           discord: domDiscord || null,
           seasonUsed: season || "",
+          ver: CACHE_VER,
+          _settle: debug ? attemptLog : undefined,
         };
-        setC(ck, out);
-        return out;
-      }
 
-      // fallback: текстовый парсер
-      const bodyText = await page.evaluate(() => document.body?.innerText || "");
-      const parsed = parseTimedRunsAll(bodyText);
-
-      if (parsed) {
-        const discord = domDiscord || parseDiscordFromText(bodyText);
-        const out = { ...parsed, regionUsed: region, discord: discord || null, seasonUsed: season || "" };
-        setC(ck, out);
+        if (!debug) setC(ck, out);
         return out;
       }
     } catch {
@@ -829,11 +830,13 @@ async function fetchTimedTotal(context, realm, name, regionHint, season) {
     }
   }
 
-  setC(ck, null);
+  if (!debug) setC(ck, null);
   return null;
 }
 
-// --- lowest for run (✅ выбираем по 5..20) ---
+// =====================
+// Lowest for run (✅ выбираем по 5..20)
+// =====================
 async function lowestFromRun(context, runUrl) {
   const rk = runKey(runUrl);
   const cached = getC(rk);
@@ -843,15 +846,15 @@ async function lowestFromRun(context, runUrl) {
   const season = seasonFromRunUrl(runUrl);
 
   const deadline = Date.now() + (RUN_TIMEOUT_MS - 3000);
-  let best = null; // {p, stat, t520}
 
+  let best = null; // {p, stat, t520}
   let attempted = 0;
   let found = 0;
 
   for (const p of roster) {
     if (Date.now() > deadline) break;
 
-    const stat = await fetchTimedTotal(context, p.realm, p.name, p.region, season);
+    const stat = await fetchTimedTotal(context, p.realm, p.name, p.region, season, false);
     attempted++;
 
     if (!stat) continue;
@@ -864,7 +867,7 @@ async function lowestFromRun(context, runUrl) {
   const partial = attempted < roster.length || found < roster.length;
 
   if (!best) {
-    const outFail = { ok: false, error: "no timed totals found", partial: true };
+    const outFail = { ok: false, error: "no timed totals found", partial: true, ver: CACHE_VER };
     setC(rk, outFail, 10 * 60 * 1000);
     return outFail;
   }
@@ -888,21 +891,16 @@ async function lowestFromRun(context, runUrl) {
 
   const out = {
     ok: true,
+    ver: CACHE_VER,
     lowest: label,
     profile_url,
     discord: best.stat.discord || null,
     warband_url: warband_url || null,
-
-    // ✅ метрика выбора
     timed_total_5_20: best.t520,
-
-    // (для отладки) что распарсили
     timed_total: best.stat.total,
     timed_breakdown: best.stat.by,
-
     season: season || "",
     partial,
-    ver: CACHE_VER,
   };
 
   setC(rk, out, partial ? 20 * 60 * 1000 : TTL_MS);
@@ -973,7 +971,7 @@ async function startWorker() {
             context = await getContext();
             setTimeout(() => enqueueRuns([u], true), 2000);
           } else {
-            setC(runKey(u), { ok: false, error: msg, partial: true }, 10 * 60 * 1000);
+            setC(runKey(u), { ok: false, error: msg, partial: true, ver: CACHE_VER }, 10 * 60 * 1000);
           }
           lastProgressAt = now();
         } finally {
@@ -1026,7 +1024,7 @@ function processBatchFast(urls) {
   for (let i = 0; i < clean.length; i++) {
     const u = clean[i];
     if (!u) {
-      results[i] = { ok: false, error: "empty url", partial: true };
+      results[i] = { ok: false, error: "empty url", partial: true, ver: CACHE_VER };
       continue;
     }
 
@@ -1035,7 +1033,7 @@ function processBatchFast(urls) {
     if (cached !== undefined) {
       if (!cached.ok && isBrowserClosedError(cached.error)) {
         cache.delete(runKey(u));
-        results[i] = { ok: false, error: "PENDING", partial: true };
+        results[i] = { ok: false, error: "PENDING", partial: true, ver: CACHE_VER };
         missing.push(u);
       } else {
         results[i] = cached;
@@ -1046,7 +1044,7 @@ function processBatchFast(urls) {
         }
       }
     } else {
-      results[i] = { ok: false, error: "PENDING", partial: true };
+      results[i] = { ok: false, error: "PENDING", partial: true, ver: CACHE_VER };
       missing.push(u);
     }
   }
@@ -1062,21 +1060,20 @@ async function processBatchFull(urls) {
   const context = await getContext();
 
   const out = await mapLimit(clean, 2, async (u) => {
-    if (!u) return { ok: false, error: "empty url", partial: true };
+    if (!u) return { ok: false, error: "empty url", partial: true, ver: CACHE_VER };
     try {
       return await lowestFromRun(context, u);
     } catch (e) {
-      return { ok: false, error: String(e.message || e), partial: true };
+      return { ok: false, error: String(e.message || e), partial: true, ver: CACHE_VER };
     }
   });
 
   return out;
 }
 
-// ✅ компактный ответ для Sheets (ускоряет JSON.parse/запись в Apps Script)
 function compactForSheet(r) {
-  if (!r) return { ok: false, error: "No data", partial: true };
-  if (!r.ok) return { ok: false, error: r.error || "ERR", partial: !!r.partial };
+  if (!r) return { ok: false, error: "No data", partial: true, ver: CACHE_VER };
+  if (!r.ok) return { ok: false, error: r.error || "ERR", partial: !!r.partial, ver: r.ver || CACHE_VER };
   return {
     ok: true,
     profile_url: r.profile_url || "",
@@ -1108,26 +1105,28 @@ app.get("/debug", (_, res) => {
 
 app.get("/lowest-from-run", async (req, res) => {
   const runUrl = req.query.url;
-  if (!runUrl) return res.status(400).json({ ok: false, error: "missing url" });
+  if (!runUrl) return res.status(400).json({ ok: false, error: "missing url", ver: CACHE_VER });
 
   try {
     const context = await getContext();
     const out = await lowestFromRun(context, String(runUrl).trim());
     return res.json(out);
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
+    return res.status(500).json({ ok: false, error: String(e.message || e), ver: CACHE_VER });
   }
 });
 
 // helper: total 5..20 для конкретного чара + season
+// ✅ debug=1 → вернёт 3 попытки settle (что именно увидел Playwright)
 app.get("/timed-total", async (req, res) => {
   const url = String(req.query.url || "").trim();
-  if (!url) return res.status(400).json({ ok: false, error: "missing url" });
+  if (!url) return res.status(400).json({ ok: false, error: "missing url", ver: CACHE_VER });
 
   const season = String(req.query.season || "").trim();
+  const debug = String(req.query.debug || "") === "1";
 
   const m = url.match(/raider\.io\/characters\/([^/]+)\/([^/]+)\/([^/?#]+)/i);
-  if (!m) return res.status(400).json({ ok: false, error: "bad character url" });
+  if (!m) return res.status(400).json({ ok: false, error: "bad character url", ver: CACHE_VER });
 
   const regionHint = String(m[1] || "").toLowerCase();
   const realm = decodeURIComponent(m[2] || "");
@@ -1135,7 +1134,7 @@ app.get("/timed-total", async (req, res) => {
 
   try {
     const context = await getContext();
-    const stat = await fetchTimedTotal(context, realm, name, regionHint, season);
+    const stat = await fetchTimedTotal(context, realm, name, regionHint, season, debug);
 
     if (!stat) return res.json({ ok: false, error: "no timed totals found", ver: CACHE_VER });
 
@@ -1153,6 +1152,7 @@ app.get("/timed-total", async (req, res) => {
       total_all_levels: stat.total,
       breakdown_all_levels: stat.by,
       regionUsed: stat.regionUsed || regionHint,
+      settle: debug ? stat._settle : undefined,
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e.message || e), ver: CACHE_VER });
@@ -1162,28 +1162,27 @@ app.get("/timed-total", async (req, res) => {
 app.get("/lowest-from-runs-get", async (req, res) => {
   try {
     const enc = req.query.urls;
-    if (!enc) return res.status(400).json({ ok: false, error: "missing urls param" });
+    if (!enc) return res.status(400).json({ ok: false, error: "missing urls param", ver: CACHE_VER });
 
     let urls;
     try {
       const json = decodeBase64WebSafeToUtf8(enc);
       urls = JSON.parse(json);
     } catch {
-      return res.status(400).json({ ok: false, error: "bad base64/json" });
+      return res.status(400).json({ ok: false, error: "bad base64/json", ver: CACHE_VER });
     }
 
     if (!Array.isArray(urls)) {
-      return res.status(400).json({ ok: false, error: "urls must be array" });
+      return res.status(400).json({ ok: false, error: "urls must be array", ver: CACHE_VER });
     }
 
     const results = await processBatchFull(urls);
     return res.json({ ok: true, results });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
+    return res.status(500).json({ ok: false, error: String(e.message || e), ver: CACHE_VER });
   }
 });
 
-// ✅ основной endpoint для Sheets
 app.post("/lowest-from-runs", async (req, res) => {
   try {
     const full = String(req.query.full || "") === "1";
@@ -1191,7 +1190,7 @@ app.post("/lowest-from-runs", async (req, res) => {
     const urls = Array.isArray(req.body) ? req.body : req.body?.urls;
 
     if (!Array.isArray(urls)) {
-      return res.status(400).json({ ok: false, error: "body must be array or { urls: array }" });
+      return res.status(400).json({ ok: false, error: "body must be array or { urls: array }", ver: CACHE_VER });
     }
 
     const resultsRaw = full ? await processBatchFull(urls) : processBatchFast(urls);
@@ -1199,7 +1198,7 @@ app.post("/lowest-from-runs", async (req, res) => {
 
     return res.json({ ok: true, results });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
+    return res.status(500).json({ ok: false, error: String(e.message || e), ver: CACHE_VER });
   }
 });
 
