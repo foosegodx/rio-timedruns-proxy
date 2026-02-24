@@ -6,10 +6,11 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ✅ чтобы спокойно принимать большие батчи
 app.use(express.json({ limit: "5mb" }));
 
-// ✅ bump версии кэша
-const CACHE_VER = "v20";
+// ✅ bump версии кэша (сброс кешей при изменениях)
+const CACHE_VER = "v21";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -23,24 +24,32 @@ const UA =
 const RUN_TIMEOUT_MS = 140_000;
 const INFLIGHT_STALE_MS = 3 * 70_000;
 
+// скорость
 const WORKER_BATCH = 6;
 const WORKER_PARALLEL = 2;
 
+// partial — попробуем дорефайнить позже
 const PARTIAL_RETRY_MAX = 2;
 const PARTIAL_RETRY_DELAY_MS = 30_000;
 const partialAttempts = new Map(); // runUrl -> attempts (server-side)
 
+// warband попытка (чтобы не зависать)
 const WAR_BAND_TIMEOUT_MS = 30_000;
+
+// ✅ лимит количества URL в одном батче
 const MAX_URLS = 1500;
 
 // =====================
 // Cache keys
 // =====================
 const runKey = (u) => `run:${CACHE_VER}:${u}`;
+
+// ✅ season-aware timed-total cache key
 const ttKey = (season, regionHint, realm, name) =>
   `tt:${CACHE_VER}:${String(season || "")}:${(regionHint || "").toLowerCase()}:${String(realm)}:${String(
     name
   )}`.toLowerCase();
+
 const wbKey = (region, realm, name) =>
   `wb:${CACHE_VER}:${region}:${String(realm)}:${String(name)}`.toLowerCase();
 
@@ -89,6 +98,7 @@ function normalizeRegion(regionRaw) {
   return "";
 }
 
+// base64 websafe (Apps Script) -> utf8 (для legacy GET)
 function decodeBase64WebSafeToUtf8(enc) {
   const s = String(enc || "");
   let b64 = s.replace(/-/g, "+").replace(/_/g, "/");
@@ -188,6 +198,7 @@ async function getContext() {
     const browser = await browserPromise;
     const context = await browser.newContext({ userAgent: UA });
 
+    // ✅ режем лишнее, но stylesheet оставляем
     await context.route("**/*", (route) => {
       const rt = route.request().resourceType();
       if (!["document", "script", "xhr", "fetch", "stylesheet"].includes(rt)) return route.abort();
@@ -308,8 +319,10 @@ function sumTimedRange(by, minLvl = 5, maxLvl = 20) {
 }
 
 /**
- * ✅ DOM-версия timed runs: пытаемся достать значения ИМЕННО из секции Mythic+ (рядом с "Mythic+ Score").
- * Возвращает { total, by } или null.
+ * ✅ DOM-версия timed runs (FIXED):
+ * - ищем labels "10+ Keystone Timed Runs" внутри секции Mythic+
+ * - для каждого label выбираем самый маленький ancestor, который содержит ТОЛЬКО этот label
+ * - внутри "карточки" берём MAX из чисто-числовых значений
  */
 async function extractTimedRunsFromDom(page) {
   return await page
@@ -321,19 +334,20 @@ async function extractTimedRunsFromDom(page) {
           .trim();
 
       const isDigits = (s) => /^\d[\d,]*$/.test(norm(s));
+
       const getLevel = (s) => {
         const m = norm(s).match(/(\d{1,3})\s*[+＋]/);
         return m ? `${m[1]}+` : null;
       };
 
-      // 1) пытаемся найти корневую секцию Mythic+ по заголовку "Mythic+ Score"
+      // root вокруг Mythic+
       const all = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"));
       const scoreHead = all.find((el) => /mythic\+\s*score/i.test(el.textContent || ""));
       const root =
         (scoreHead && (scoreHead.closest("section,article,aside,div") || scoreHead.parentElement)) ||
         document.body;
 
-      // 2) внутри root ищем лейблы с "Keystone Timed Runs" и уровнем "10+ / 15+ / 20+ / 5+"
+      // все labels вида "10+ Keystone Timed Runs"
       const labels = Array.from(root.querySelectorAll("div,span,p,a,li"))
         .filter((el) => {
           const t = norm(el.textContent);
@@ -341,26 +355,41 @@ async function extractTimedRunsFromDom(page) {
         })
         .slice(0, 200);
 
+      if (!labels.length) return null;
+
+      // сколько label-элементов внутри node
+      const countLabelsInside = (node) => {
+        let c = 0;
+        for (const l of labels) if (node.contains(l)) c++;
+        return c;
+      };
+
       const by = {};
 
       for (const lab of labels) {
         const lvl = getLevel(lab.textContent);
         if (!lvl) continue;
 
-        const card = lab.closest("div,li,a,section") || lab.parentElement || lab;
+        // поднимаемся вверх, пока родитель содержит только этот label
+        let card = lab;
+        for (let i = 0; i < 10; i++) {
+          const p = card.parentElement;
+          if (!p) break;
+          const n = countLabelsInside(p);
+          if (n > 1) break; // выше начинается общий контейнер на несколько карточек
+          card = p;
+        }
 
-        // ищем число в этой карточке (обычно отдельным элементом)
+        // чисто-числовые значения внутри карточки
         const nums = Array.from(card.querySelectorAll("div,span,p,strong,b"))
           .map((x) => norm(x.textContent))
-          .filter((x) => x && isDigits(x));
+          .filter((x) => x && isDigits(x))
+          .map((x) => Number(x.replace(/,/g, "")))
+          .filter((x) => Number.isFinite(x));
 
-        // берём первое "чистое" число (это обычно и есть 148/86/180…)
-        const raw = nums.length ? nums[0] : null;
-        if (!raw) continue;
+        if (!nums.length) continue;
 
-        const count = Number(raw.replace(/,/g, ""));
-        if (!Number.isFinite(count)) continue;
-
+        const count = Math.max(...nums);
         by[lvl] = Math.max(by[lvl] || 0, count);
       }
 
@@ -751,7 +780,7 @@ async function fetchTimedTotal(context, realm, name, regionHint, season) {
 
       const domDiscord = await extractDiscordFromDom(page);
 
-      // ✅ СНАЧАЛА DOM timed-runs (точнее, не путает сезоны/блоки)
+      // ✅ DOM timed runs (точнее, не путает блоки)
       const domTimed = await extractTimedRunsFromDom(page);
       if (domTimed) {
         const out = {
@@ -765,7 +794,7 @@ async function fetchTimedTotal(context, realm, name, regionHint, season) {
         return out;
       }
 
-      // fallback: текстовый парсер (как раньше)
+      // fallback: текстовый парсер
       const bodyText = await page.evaluate(() => document.body?.innerText || "");
       const parsed = parseTimedRunsAll(bodyText);
 
@@ -813,7 +842,6 @@ async function lowestFromRun(context, runUrl) {
     found++;
 
     const t520 = sumTimedRange(stat.by, 5, 20).total;
-
     if (!best || t520 < best.t520) best = { p, stat, t520 };
   }
 
@@ -853,7 +881,7 @@ async function lowestFromRun(context, runUrl) {
     // ✅ что именно сравнивали
     timed_total_5_20: best.t520,
 
-    // оставим и полный breakdown (как раньше)
+    // оставим и полный breakdown (на всякий)
     timed_total: best.stat.total,
     timed_breakdown: best.stat.by,
 
@@ -1077,6 +1105,8 @@ app.get("/lowest-from-run", async (req, res) => {
 });
 
 // helper: total 5..20 для конкретного чара + season
+// usage:
+// /timed-total?url=https://raider.io/characters/eu/zenedar/Atrius&season=season-tww-3
 app.get("/timed-total", async (req, res) => {
   const url = String(req.query.url || "").trim();
   if (!url) return res.status(400).json({ ok: false, error: "missing url" });
