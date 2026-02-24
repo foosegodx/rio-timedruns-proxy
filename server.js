@@ -6,11 +6,10 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ✅ чтобы спокойно принимать большие батчи
 app.use(express.json({ limit: "5mb" }));
 
 // ✅ bump версии кэша (сброс кешей при изменениях)
-const CACHE_VER = "v21";
+const CACHE_VER = "v22";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -44,7 +43,6 @@ const MAX_URLS = 1500;
 // =====================
 const runKey = (u) => `run:${CACHE_VER}:${u}`;
 
-// ✅ season-aware timed-total cache key
 const ttKey = (season, regionHint, realm, name) =>
   `tt:${CACHE_VER}:${String(season || "")}:${(regionHint || "").toLowerCase()}:${String(realm)}:${String(
     name
@@ -319,10 +317,11 @@ function sumTimedRange(by, minLvl = 5, maxLvl = 20) {
 }
 
 /**
- * ✅ DOM-версия timed runs (FIXED):
- * - ищем labels "10+ Keystone Timed Runs" внутри секции Mythic+
- * - для каждого label выбираем самый маленький ancestor, который содержит ТОЛЬКО этот label
- * - внутри "карточки" берём MAX из чисто-числовых значений
+ * ✅ DOM-версия timed runs (v22 FIX):
+ * 1) Находим элементы внутри Mythic+ секции, где есть "Keystone Timed Runs" и уровень "10+/15+/20+..."
+ * 2) Находим минимальный контейнер, который содержит ВСЕ эти элементы
+ * 3) Парсим container.innerText как "связный блок" count->level->Keystone Timed Runs
+ *    и берём ПЕРВЫЙ блок, который покрывает >= 3 уровней (10/15/20), чтобы не схватить вторую копию
  */
 async function extractTimedRunsFromDom(page) {
   return await page
@@ -333,69 +332,104 @@ async function extractTimedRunsFromDom(page) {
           .replace(/\s+/g, " ")
           .trim();
 
-      const isDigits = (s) => /^\d[\d,]*$/.test(norm(s));
-
-      const getLevel = (s) => {
-        const m = norm(s).match(/(\d{1,3})\s*[+＋]/);
-        return m ? `${m[1]}+` : null;
-      };
-
-      // root вокруг Mythic+
       const all = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"));
       const scoreHead = all.find((el) => /mythic\+\s*score/i.test(el.textContent || ""));
       const root =
         (scoreHead && (scoreHead.closest("section,article,aside,div") || scoreHead.parentElement)) ||
         document.body;
 
-      // все labels вида "10+ Keystone Timed Runs"
-      const labels = Array.from(root.querySelectorAll("div,span,p,a,li"))
+      // кандидаты: любые элементы в root, содержащие "Keystone Timed Runs" и "10+"
+      const hits = Array.from(root.querySelectorAll("*"))
         .filter((el) => {
-          const t = norm(el.textContent);
-          return /keystone timed runs/i.test(t) && /(\d{1,3})\s*[+＋]/.test(t);
+          const t = norm(el.textContent || "");
+          if (!t) return false;
+          if (!/keystone timed runs/i.test(t)) return false;
+          return /(\d{1,3})\s*[+＋]/.test(t);
         })
         .slice(0, 200);
 
-      if (!labels.length) return null;
+      if (!hits.length) return null;
 
-      // сколько label-элементов внутри node
-      const countLabelsInside = (node) => {
-        let c = 0;
-        for (const l of labels) if (node.contains(l)) c++;
-        return c;
-      };
-
-      const by = {};
-
-      for (const lab of labels) {
-        const lvl = getLevel(lab.textContent);
-        if (!lvl) continue;
-
-        // поднимаемся вверх, пока родитель содержит только этот label
-        let card = lab;
-        for (let i = 0; i < 10; i++) {
-          const p = card.parentElement;
-          if (!p) break;
-          const n = countLabelsInside(p);
-          if (n > 1) break; // выше начинается общий контейнер на несколько карточек
-          card = p;
-        }
-
-        // чисто-числовые значения внутри карточки
-        const nums = Array.from(card.querySelectorAll("div,span,p,strong,b"))
-          .map((x) => norm(x.textContent))
-          .filter((x) => x && isDigits(x))
-          .map((x) => Number(x.replace(/,/g, "")))
-          .filter((x) => Number.isFinite(x));
-
-        if (!nums.length) continue;
-
-        const count = Math.max(...nums);
-        by[lvl] = Math.max(by[lvl] || 0, count);
+      // минимальный общий контейнер: поднимаемся от первого hit вверх, пока container содержит все hits
+      const first = hits[0];
+      let container = first;
+      for (let i = 0; i < 18; i++) {
+        const p = container.parentElement;
+        if (!p) break;
+        const ok = hits.every((h) => p.contains(h));
+        if (!ok) break;
+        container = p;
       }
 
+      const txt = String(container.innerText || container.textContent || "");
+      if (!txt) return null;
+
+      // собираем все совпадения с индексами
+      const matches = [];
+
+      const pushMatch = (idx, countRaw, levelRaw) => {
+        const level = String(levelRaw || "").replace(/\uFF0B/g, "+").trim();
+        const count = Number(String(countRaw || "").replace(/,/g, ""));
+        if (!level || !Number.isFinite(count)) return;
+        matches.push({ idx, level, count });
+      };
+
+      // count -> level -> label (часто именно так)
+      const pA = /(\d[\d,]*)\s*(?:\n|\s)+(\d{1,3}[+\uFF0B])\s*(?:\n|\s)+Keystone\s+Timed\s+Runs/gi;
+      // level -> label -> count
+      const pB = /(\d{1,3}[+\uFF0B])\s*(?:\n|\s)+Keystone\s+Timed\s+Runs\s*(?:\n|\s)+(\d[\d,]*)/gi;
+      // inline варианты
+      const pC = /(\d[\d,]*)\s+(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs/gi;
+      const pD = /(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs\s+(\d[\d,]*)/gi;
+
+      let m;
+      while ((m = pA.exec(txt)) !== null) pushMatch(m.index, m[1], m[2]);
+      while ((m = pB.exec(txt)) !== null) pushMatch(m.index, m[2], m[1]);
+      while ((m = pC.exec(txt)) !== null) pushMatch(m.index, m[1], m[2]);
+      while ((m = pD.exec(txt)) !== null) pushMatch(m.index, m[2], m[1]);
+
+      if (!matches.length) return null;
+
+      matches.sort((a, b) => a.idx - b.idx);
+
+      // берём ПЕРВЫЙ "связный блок", который покрывает минимум 3 уровня (обычно 10/15/20)
+      const WANT = new Set(["10+", "15+", "20+", "5+"]);
+      const best = null;
+
+      for (let i = 0; i < matches.length; i++) {
+        const by = {};
+        const seen = new Set();
+
+        // окно до 20 совпадений вперёд (обычно хватает)
+        for (let j = i; j < Math.min(matches.length, i + 20); j++) {
+          const { level, count } = matches[j];
+          if (!WANT.has(level)) {
+            // всё равно можем учитывать, но для блока ключевые — эти уровни
+            // оставим без исключения, но не добавляем в seen
+          }
+
+          if (by[level] === undefined) by[level] = count;
+          seen.add(level);
+
+          const hasCore =
+            (seen.has("10+") && seen.has("15+") && seen.has("20+")) ||
+            (seen.has("10+") && seen.has("15+") && seen.has("5+"));
+
+          if (hasCore) {
+            const keys = Object.keys(by);
+            const total = keys.reduce((s, k) => s + (by[k] || 0), 0);
+            return { total, by };
+          }
+        }
+      }
+
+      // fallback: просто первые уникальные уровни по порядку
+      const by = {};
+      for (const { level, count } of matches) {
+        if (by[level] === undefined) by[level] = count;
+      }
       const keys = Object.keys(by);
       if (!keys.length) return null;
-
       const total = keys.reduce((s, k) => s + (by[k] || 0), 0);
       return { total, by };
     })
@@ -501,6 +535,9 @@ async function extractDiscordFromDom(page) {
     .catch(() => null);
 }
 
+/**
+ * ✅ Fallback по тексту (безопасный): берём ТОЛЬКО "name#1234".
+ */
 function parseDiscordFromText(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const idx = t.toLowerCase().indexOf("contact info");
@@ -769,7 +806,7 @@ async function fetchTimedTotal(context, realm, name, regionHint, season) {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
 
       try {
-        await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 6000 });
+        await page.waitForSelector('text=/Keystone\\s+Timed\\s+Runs/i', { timeout: 7000 });
       } catch (_) {}
       try {
         await page.waitForSelector('text=/Mythic\\+\\s*Score/i', { timeout: 5000 });
@@ -780,7 +817,7 @@ async function fetchTimedTotal(context, realm, name, regionHint, season) {
 
       const domDiscord = await extractDiscordFromDom(page);
 
-      // ✅ DOM timed runs (точнее, не путает блоки)
+      // ✅ DOM timed runs (в22)
       const domTimed = await extractTimedRunsFromDom(page);
       if (domTimed) {
         const out = {
@@ -878,10 +915,8 @@ async function lowestFromRun(context, runUrl) {
     discord: best.stat.discord || null,
     warband_url: warband_url || null,
 
-    // ✅ что именно сравнивали
     timed_total_5_20: best.t520,
 
-    // оставим и полный breakdown (на всякий)
     timed_total: best.stat.total,
     timed_breakdown: best.stat.by,
 
@@ -1024,7 +1059,6 @@ function processBatchFast(urls) {
       } else {
         results[i] = cached;
 
-        // ✅ don't re-enqueue partial forever; respect PARTIAL_RETRY_MAX
         if (cached.ok && cached.partial) {
           const n = partialAttempts.get(u) || 0;
           if (n < PARTIAL_RETRY_MAX) needRefine.push(u);
@@ -1058,7 +1092,7 @@ async function processBatchFull(urls) {
   return out;
 }
 
-// ✅ компактный ответ для Sheets (ускоряет JSON.parse/запись в Apps Script)
+// ✅ компактный ответ для Sheets
 function compactForSheet(r) {
   if (!r) return { ok: false, error: "No data", partial: true };
   if (!r.ok) return { ok: false, error: r.error || "ERR", partial: !!r.partial };
@@ -1105,8 +1139,6 @@ app.get("/lowest-from-run", async (req, res) => {
 });
 
 // helper: total 5..20 для конкретного чара + season
-// usage:
-// /timed-total?url=https://raider.io/characters/eu/zenedar/Atrius&season=season-tww-3
 app.get("/timed-total", async (req, res) => {
   const url = String(req.query.url || "").trim();
   if (!url) return res.status(400).json({ ok: false, error: "missing url" });
@@ -1169,6 +1201,7 @@ app.get("/lowest-from-runs-get", async (req, res) => {
   }
 });
 
+// ✅ основной endpoint для Sheets
 app.post("/lowest-from-runs", async (req, res) => {
   try {
     const full = String(req.query.full || "") === "1";
