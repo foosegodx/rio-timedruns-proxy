@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: "5mb" }));
 
 // ✅ bump версии кэша (сброс кешей при изменениях)
-const CACHE_VER = "v22";
+const CACHE_VER = "v23";
 
 const cache = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
@@ -23,19 +23,14 @@ const UA =
 const RUN_TIMEOUT_MS = 140_000;
 const INFLIGHT_STALE_MS = 3 * 70_000;
 
-// скорость
 const WORKER_BATCH = 6;
 const WORKER_PARALLEL = 2;
 
-// partial — попробуем дорефайнить позже
 const PARTIAL_RETRY_MAX = 2;
 const PARTIAL_RETRY_DELAY_MS = 30_000;
 const partialAttempts = new Map(); // runUrl -> attempts (server-side)
 
-// warband попытка (чтобы не зависать)
 const WAR_BAND_TIMEOUT_MS = 30_000;
-
-// ✅ лимит количества URL в одном батче
 const MAX_URLS = 1500;
 
 // =====================
@@ -96,7 +91,6 @@ function normalizeRegion(regionRaw) {
   return "";
 }
 
-// base64 websafe (Apps Script) -> utf8 (для legacy GET)
 function decodeBase64WebSafeToUtf8(enc) {
   const s = String(enc || "");
   let b64 = s.replace(/-/g, "+").replace(/_/g, "/");
@@ -300,7 +294,6 @@ function parseTimedRunsAll(text) {
   return { total, by };
 }
 
-// ✅ суммирование только диапазона 5..20 (включительно)
 function sumTimedRange(by, minLvl = 5, maxLvl = 20) {
   let total = 0;
   const out = {};
@@ -317,11 +310,11 @@ function sumTimedRange(by, minLvl = 5, maxLvl = 20) {
 }
 
 /**
- * ✅ DOM-версия timed runs (v22 FIX):
- * 1) Находим элементы внутри Mythic+ секции, где есть "Keystone Timed Runs" и уровень "10+/15+/20+..."
- * 2) Находим минимальный контейнер, который содержит ВСЕ эти элементы
- * 3) Парсим container.innerText как "связный блок" count->level->Keystone Timed Runs
- *    и берём ПЕРВЫЙ блок, который покрывает >= 3 уровней (10/15/20), чтобы не схватить вторую копию
+ * ✅ DOM-версия timed runs (v23):
+ * Пары "уровень -> число" собираем по геометрии:
+ * - находим label элементы "X+ Keystone Timed Runs"
+ * - находим элементы с чистыми цифрами рядом
+ * - сопоставляем по минимальной разнице по Y (строка) и обычно справа (dx>=0)
  */
 async function extractTimedRunsFromDom(page) {
   return await page
@@ -332,104 +325,95 @@ async function extractTimedRunsFromDom(page) {
           .replace(/\s+/g, " ")
           .trim();
 
+      const getLevel = (s) => {
+        const m = norm(s).match(/(\d{1,3})\s*[+＋]/);
+        return m ? `${m[1]}+` : null;
+      };
+
+      const isDigits = (s) => /^\d[\d,]*$/.test(norm(s));
+
+      // ограничиваем область Mythic+ секцией
       const all = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"));
       const scoreHead = all.find((el) => /mythic\+\s*score/i.test(el.textContent || ""));
       const root =
         (scoreHead && (scoreHead.closest("section,article,aside,div") || scoreHead.parentElement)) ||
         document.body;
 
-      // кандидаты: любые элементы в root, содержащие "Keystone Timed Runs" и "10+"
-      const hits = Array.from(root.querySelectorAll("*"))
+      // label-элементы "10+ Keystone Timed Runs"
+      const labels = Array.from(root.querySelectorAll("*"))
         .filter((el) => {
           const t = norm(el.textContent || "");
-          if (!t) return false;
-          if (!/keystone timed runs/i.test(t)) return false;
-          return /(\d{1,3})\s*[+＋]/.test(t);
+          return /keystone timed runs/i.test(t) && /(\d{1,3})\s*[+＋]/.test(t);
         })
         .slice(0, 200);
 
-      if (!hits.length) return null;
+      if (!labels.length) return null;
 
-      // минимальный общий контейнер: поднимаемся от первого hit вверх, пока container содержит все hits
-      const first = hits[0];
-      let container = first;
-      for (let i = 0; i < 18; i++) {
-        const p = container.parentElement;
-        if (!p) break;
-        const ok = hits.every((h) => p.contains(h));
-        if (!ok) break;
-        container = p;
-      }
+      // кандидаты-цифры (в этой же области)
+      const nums = Array.from(root.querySelectorAll("*"))
+        .filter((el) => {
+          // чтобы не брать контейнеры, берём листья
+          if (el.children && el.children.length > 0) return false;
+          const t = norm(el.textContent || "");
+          return t && isDigits(t);
+        })
+        .slice(0, 600)
+        .map((el) => {
+          const r = el.getBoundingClientRect();
+          const t = norm(el.textContent || "");
+          const v = Number(t.replace(/,/g, ""));
+          return {
+            el,
+            v,
+            cx: r.left + r.width / 2,
+            cy: r.top + r.height / 2,
+            w: r.width,
+            h: r.height,
+          };
+        })
+        .filter((x) => Number.isFinite(x.v) && x.v >= 0);
 
-      const txt = String(container.innerText || container.textContent || "");
-      if (!txt) return null;
+      if (!nums.length) return null;
 
-      // собираем все совпадения с индексами
-      const matches = [];
-
-      const pushMatch = (idx, countRaw, levelRaw) => {
-        const level = String(levelRaw || "").replace(/\uFF0B/g, "+").trim();
-        const count = Number(String(countRaw || "").replace(/,/g, ""));
-        if (!level || !Number.isFinite(count)) return;
-        matches.push({ idx, level, count });
-      };
-
-      // count -> level -> label (часто именно так)
-      const pA = /(\d[\d,]*)\s*(?:\n|\s)+(\d{1,3}[+\uFF0B])\s*(?:\n|\s)+Keystone\s+Timed\s+Runs/gi;
-      // level -> label -> count
-      const pB = /(\d{1,3}[+\uFF0B])\s*(?:\n|\s)+Keystone\s+Timed\s+Runs\s*(?:\n|\s)+(\d[\d,]*)/gi;
-      // inline варианты
-      const pC = /(\d[\d,]*)\s+(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs/gi;
-      const pD = /(\d{1,3}[+\uFF0B])\s+Keystone\s+Timed\s+Runs\s+(\d[\d,]*)/gi;
-
-      let m;
-      while ((m = pA.exec(txt)) !== null) pushMatch(m.index, m[1], m[2]);
-      while ((m = pB.exec(txt)) !== null) pushMatch(m.index, m[2], m[1]);
-      while ((m = pC.exec(txt)) !== null) pushMatch(m.index, m[1], m[2]);
-      while ((m = pD.exec(txt)) !== null) pushMatch(m.index, m[2], m[1]);
-
-      if (!matches.length) return null;
-
-      matches.sort((a, b) => a.idx - b.idx);
-
-      // берём ПЕРВЫЙ "связный блок", который покрывает минимум 3 уровня (обычно 10/15/20)
-      const WANT = new Set(["10+", "15+", "20+", "5+"]);
-      const best = null;
-
-      for (let i = 0; i < matches.length; i++) {
-        const by = {};
-        const seen = new Set();
-
-        // окно до 20 совпадений вперёд (обычно хватает)
-        for (let j = i; j < Math.min(matches.length, i + 20); j++) {
-          const { level, count } = matches[j];
-          if (!WANT.has(level)) {
-            // всё равно можем учитывать, но для блока ключевые — эти уровни
-            // оставим без исключения, но не добавляем в seen
-          }
-
-          if (by[level] === undefined) by[level] = count;
-          seen.add(level);
-
-          const hasCore =
-            (seen.has("10+") && seen.has("15+") && seen.has("20+")) ||
-            (seen.has("10+") && seen.has("15+") && seen.has("5+"));
-
-          if (hasCore) {
-            const keys = Object.keys(by);
-            const total = keys.reduce((s, k) => s + (by[k] || 0), 0);
-            return { total, by };
-          }
-        }
-      }
-
-      // fallback: просто первые уникальные уровни по порядку
       const by = {};
-      for (const { level, count } of matches) {
-        if (by[level] === undefined) by[level] = count;
+
+      for (const lab of labels) {
+        const lvl = getLevel(lab.textContent || "");
+        if (!lvl) continue;
+
+        const r = lab.getBoundingClientRect();
+        const lcx = r.left + r.width / 2;
+        const lcy = r.top + r.height / 2;
+
+        // ищем число на той же строке (по Y), предпочтительно справа
+        let best = null;
+
+        for (const n of nums) {
+          // игнорируем числа, которые являются частью самого label (если вдруг)
+          if (lab.contains(n.el)) continue;
+
+          const dy = Math.abs(n.cy - lcy);
+
+          // "строка" — обычно очень близко по Y; даём небольшой допуск
+          if (dy > Math.max(18, r.height * 0.9)) continue;
+
+          const dx = n.cx - lcx;
+          // предпочтительно справа, но если верстка поменялась, позволим и слева (с штрафом)
+          const dxPenalty = dx >= 0 ? 0 : Math.abs(dx) + 200;
+
+          const score = dy * 10 + dxPenalty;
+
+          if (!best || score < best.score) best = { v: n.v, score };
+        }
+
+        if (!best) continue;
+
+        by[lvl] = Math.max(by[lvl] || 0, best.v);
       }
+
       const keys = Object.keys(by);
       if (!keys.length) return null;
+
       const total = keys.reduce((s, k) => s + (by[k] || 0), 0);
       return { total, by };
     })
@@ -437,7 +421,7 @@ async function extractTimedRunsFromDom(page) {
 }
 
 /**
- * ✅ DOM-версия: достаёт Discord строго из строки с иконкой Discord в Contact Info.
+ * ✅ Discord DOM extractor
  */
 async function extractDiscordFromDom(page) {
   return await page
@@ -535,9 +519,6 @@ async function extractDiscordFromDom(page) {
     .catch(() => null);
 }
 
-/**
- * ✅ Fallback по тексту (безопасный): берём ТОЛЬКО "name#1234".
- */
 function parseDiscordFromText(text) {
   const t = String(text || "").replace(/\u00a0/g, " ");
   const idx = t.toLowerCase().indexOf("contact info");
@@ -589,7 +570,7 @@ function parseDiscordFromText(text) {
 }
 
 // =====================
-// Warband helpers
+// Warband helpers (как было)
 // =====================
 async function findWarbandUrlFromPage(page) {
   const href = await page
@@ -817,7 +798,6 @@ async function fetchTimedTotal(context, realm, name, regionHint, season) {
 
       const domDiscord = await extractDiscordFromDom(page);
 
-      // ✅ DOM timed runs (в22)
       const domTimed = await extractTimedRunsFromDom(page);
       if (domTimed) {
         const out = {
@@ -831,7 +811,6 @@ async function fetchTimedTotal(context, realm, name, regionHint, season) {
         return out;
       }
 
-      // fallback: текстовый парсер
       const bodyText = await page.evaluate(() => document.body?.innerText || "");
       const parsed = parseTimedRunsAll(bodyText);
 
@@ -914,12 +893,9 @@ async function lowestFromRun(context, runUrl) {
     profile_url,
     discord: best.stat.discord || null,
     warband_url: warband_url || null,
-
     timed_total_5_20: best.t520,
-
     timed_total: best.stat.total,
     timed_breakdown: best.stat.by,
-
     season: season || "",
     partial,
   };
@@ -1092,7 +1068,6 @@ async function processBatchFull(urls) {
   return out;
 }
 
-// ✅ компактный ответ для Sheets
 function compactForSheet(r) {
   if (!r) return { ok: false, error: "No data", partial: true };
   if (!r.ok) return { ok: false, error: r.error || "ERR", partial: !!r.partial };
@@ -1138,7 +1113,6 @@ app.get("/lowest-from-run", async (req, res) => {
   }
 });
 
-// helper: total 5..20 для конкретного чара + season
 app.get("/timed-total", async (req, res) => {
   const url = String(req.query.url || "").trim();
   if (!url) return res.status(400).json({ ok: false, error: "missing url" });
@@ -1201,7 +1175,6 @@ app.get("/lowest-from-runs-get", async (req, res) => {
   }
 });
 
-// ✅ основной endpoint для Sheets
 app.post("/lowest-from-runs", async (req, res) => {
   try {
     const full = String(req.query.full || "") === "1";
